@@ -751,10 +751,18 @@ async def create_support_ticket(
 
 # ==================== YOUTUBE LIVE STREAMING ENDPOINTS ====================
 
+def _public_base_url(request: Request) -> str:
+    """Base URL for building OAuth redirect + post-callback redirects.
+    Prefers PUBLIC_APP_URL (set this in production, e.g. https://liveadda.org)
+    to avoid http/https or proxy-header ambiguity; falls back to request.base_url."""
+    configured = os.environ.get("PUBLIC_APP_URL", "").strip()
+    if configured:
+        return configured.rstrip("/")
+    return str(request.base_url).rstrip("/")
+
 def _youtube_redirect_uri(request: Request) -> str:
-    """Build the OAuth redirect URI from the incoming request's base URL."""
-    base = str(request.base_url).rstrip("/")
-    return f"{base}/api/youtube/oauth/callback"
+    """Build the OAuth redirect URI from the public base URL."""
+    return f"{_public_base_url(request)}/api/youtube/oauth/callback"
 
 @api_router.get("/youtube/status")
 async def youtube_status(user: dict = Depends(get_current_user)):
@@ -794,7 +802,7 @@ async def youtube_oauth_callback(request: Request):
     params = dict(request.query_params)
     code = params.get("code")
     state = params.get("state")  # user_id
-    base = str(request.base_url).rstrip("/")
+    base = _public_base_url(request)
 
     if not code or not state:
         return RedirectResponse(url=f"{base}/dashboard/live-slot?youtube=error")
