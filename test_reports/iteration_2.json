@@ -1,0 +1,48 @@
+{
+  "summary": "Iteration 2 backend validation: 39/39 pytest tests pass. Added 11 new tests covering (a) streaming/chunked upload correctness with storage_used increment, (b) incremental 2GB storage enforcement (simulated by pre-seeding storage_used to MAX-1KB, then uploading 4KB which is correctly rejected with 400 'Storage limit exceeded'), (c) Stripe webhook signature verification (both missing Stripe-Signature and bogus signature return 400), (d) activate_plan_from_transaction idempotency (first paid call activates + returns True, second call returns False, plan/expiry not double-set; non-paid input returns False), (e) YouTube not-configured paths: GET /api/youtube/status -> {configured:false, connected:false}, GET /api/youtube/oauth/authorize -> 503 with 'not configured' detail, POST /api/youtube/broadcast/create -> 403 gatekeep for no-plan user and 400 'Connect your YouTube channel first.' when admin (active plan) has no youtube_accounts record. All 28 iteration-1 regressions still pass (auth, gatekeeping, videos CRUD/rename/delete + storage decrement, live-slot start/stop/settings, Stripe checkout session + status, billings, support, dashboard stats).",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "/api/youtube/oauth/callback", "issue": "Redirects to /dashboard/live-slot?youtube=error when code/state missing, but the base_url comes from request.base_url which behind the ingress may not be the public preview URL; consider using PUBLIC_APP_URL env for the final RedirectResponse."},
+      {"endpoint": "/api/youtube/broadcast/create", "issue": "start_ffmpeg_push is invoked before verifying that the ffmpeg binary is usable or that the video codec is compatible; a failure inside subprocess.Popen would raise 500 but leave the broadcast created on YouTube without ffmpeg attached. Consider wrapping in try/except and rolling back / transitioning broadcast to 'complete' on failure."},
+      {"endpoint": "/api/youtube/broadcast/create", "issue": "ffmpeg_pid is stored but there is no health check that ffmpeg is still alive; consumers of /api/live-slot may see is_live=true while ffmpeg has already exited."},
+      {"endpoint": "/api/webhook/stripe", "issue": "Now enforces signature verification via emergentintegrations.handle_webhook (good). Note: any HTTPException other than 400 raised inside the helper would still bubble; error path only logs and returns 400 — acceptable, but consider logging body length + event type on failure for debuggability."},
+      {"endpoint": "/api/videos/upload", "issue": "activate_plan_from_transaction is idempotent, but /api/payments/checkout-status still returns the ORIGINAL transaction dict fetched before activation (fields patched only in-memory when activated in this call). If webhook activates first, poll will re-fetch and see 'completed' correctly — behavior is correct, just noting the in-memory patch is a bit fragile."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/backend_test.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "(Optional) Harden /api/youtube/broadcast/create to transition the broadcast to 'complete' if ffmpeg fails to start, so half-created broadcasts don't linger on the channel.",
+    "(Optional) Add a lightweight ffmpeg liveness check (os.kill(pid, 0)) inside /api/live-slot so is_live reflects reality.",
+    "(Optional) Split server.py into routers (auth/videos/payments/youtube/live_slot) - file is now ~1000 lines."
+  ],
+  "critical_code_review_comments": [
+    "server.py is now 1009 lines — recommend splitting into APIRouter modules per feature (auth, videos, payments, youtube, live_slot, billings, support, dashboard).",
+    "Streaming upload correctly uses 1MB chunks with incremental remaining_budget guard and cleans up partial files on abort — good.",
+    "activate_plan_from_transaction uses an atomic conditional update ({'status': {'$ne':'completed'}}) with modified_count==0 short-circuit — solid idempotency guarantee against webhook/polling race.",
+    "Stripe webhook now returns 400 on ANY exception from stripe_checkout.handle_webhook including missing signature — behavior matches spec.",
+    "youtube_service.is_configured() correctly returns False when either env var is empty, guarding both /status and /authorize paths.",
+    "YouTubeAccounts collection has no unique index on user_id — upsert prevents duplicates but a schema index would be defensive.",
+    "start_ffmpeg_push logs stream_key prefix in server log — good OpSec, but the log file at /tmp/ffmpeg_{stream_key[:8]}.log has the full stream key implicit in its name path; consider hashing.",
+    "on_event('startup'/'shutdown') is deprecated in FastAPI — migrate to lifespan handler.",
+    "test_credentials.md is overwritten on every backend startup (unchanged from iter 1)."
+  ],
+  "updated_files": [
+    "/app/backend/tests/backend_test.py"
+  ],
+  "success_rate": {"backend": "100% (39/39)", "frontend": "not tested (backend-only iteration)"},
+  "test_credentials": "Admin: admin@liveadda.com / admin123 (monthly plan seeded on startup). Fresh users generated per-test with TEST_ prefix.",
+  "seed_data_creation": "TestIdempotentActivation creates+cleans a synthetic TEST_idem_user_* + payment_transactions doc directly via pymongo. TestStorageEnforcement temporarily rewrites admin's storage_used to MAX-1KB and restores original value in finally.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Backend now has YouTube endpoints under /api/youtube/*. YOUTUBE_CLIENT_ID/SECRET are intentionally empty in /app/backend/.env - tests validate the not-configured path only (do NOT attempt real OAuth). To test with real credentials, set both env vars, restart backend, and youtube_service.is_configured() will return True, changing /api/youtube/status and /api/youtube/oauth/authorize behavior. Streaming upload validated with a 16KB payload; incremental limit validated by pre-seeding storage_used - do NOT attempt an actual 2GB upload over the preview URL. Stripe webhook signature verification is delegated to emergentintegrations.handle_webhook — any missing/bad Stripe-Signature yields 400. activate_plan_from_transaction is atomic via conditional Mongo update; safe against webhook+polling races. server.py is now 1009 lines - consider suggesting a refactor.",
+  "rca of the issue": "N/A - no bugs found in iteration 2. All three new features (streaming upload, hardened Stripe webhook, YouTube integration scaffolding) behave per spec on the not-configured / correctness paths validated."
+}

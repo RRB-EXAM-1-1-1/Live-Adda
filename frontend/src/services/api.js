@@ -222,4 +222,52 @@ export const dashboardAPI = {
   }
 };
 
+// YouTube APIs
+export const youtubeAPI = {
+  getStatus: async () => {
+    try {
+      const { data } = await api.get('/youtube/status');
+      return { data, error: null };
+    } catch (error) {
+      return { data: null, error: formatApiError(error) };
+    }
+  },
+
+  getAuthUrl: async () => {
+    try {
+      const { data } = await api.get('/youtube/oauth/authorize');
+      return { data, error: null };
+    } catch (error) {
+      return { data: null, error: formatApiError(error) };
+    }
+  },
+
+  disconnect: async () => {
+    try {
+      await api.delete('/youtube/disconnect');
+      return { error: null };
+    } catch (error) {
+      return { error: formatApiError(error) };
+    }
+  },
+
+  createBroadcast: async (videoId, title) => {
+    try {
+      const { data } = await api.post('/youtube/broadcast/create', { video_id: videoId, title });
+      return { data, error: null };
+    } catch (error) {
+      return { data: null, error: formatApiError(error) };
+    }
+  },
+
+  stopBroadcast: async () => {
+    try {
+      const { data } = await api.post('/youtube/broadcast/stop');
+      return { data, error: null };
+    } catch (error) {
+      return { data: null, error: formatApiError(error) };
+    }
+  }
+};
+
 export default api;

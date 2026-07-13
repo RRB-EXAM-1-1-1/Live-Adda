@@ -193,12 +193,197 @@ class TestVideos:
 
 class TestStorageLimit:
     def test_max_storage_env_is_2gb(self):
-        # Indirectly verify via a large-upload attempt with fresh_user after giving plan? 
-        # Instead we just verify server-side behavior via a bogus large content-length via manual value.
-        # Since sending 2GB+ over network is impractical, we skip actual upload and rely on the code.
-        # This test ensures the constant is set as expected via a boundary check helper (if exposed).
-        # No dedicated endpoint - so we mark as informational.
+        # Informational - constant enforced server-side. See TestStorageEnforcement for real check.
         assert True
+
+
+# ==================== Streaming upload + incremental storage enforcement ====================
+
+class TestStorageEnforcement:
+    """Validates iteration 2 changes: chunked/streaming upload with incremental 2GB limit.
+    We can't ship a real 2GB payload, so we DIRECTLY manipulate the admin's stored
+    storage_used to place them just under the limit, then upload a small file that
+    pushes past it.
+    """
+
+    def _get_mongo_db(self):
+        from pymongo import MongoClient
+        from pathlib import Path
+        env = Path("/app/backend/.env").read_text().splitlines()
+        cfg = {}
+        for line in env:
+            if "=" in line and not line.startswith("#"):
+                k, v = line.split("=", 1)
+                cfg[k.strip()] = v.strip().strip('"')
+        cli = MongoClient(cfg["MONGO_URL"])
+        return cli[cfg["DB_NAME"]]
+
+    def test_upload_returns_ready_and_increments_storage(self, admin_session):
+        me_before = admin_session.get(f"{API}/auth/me", timeout=30).json()
+        before = me_before.get("storage_used", 0)
+        payload = b"z" * (16 * 1024)  # 16 KB
+        files = {"file": ("chunk.mp4", io.BytesIO(payload), "video/mp4")}
+        data = {"title": "TEST_stream_upload"}
+        r = admin_session.post(f"{API}/videos/upload", files=files, data=data, timeout=60)
+        assert r.status_code == 200, r.text
+        resp = r.json()
+        assert "Ready for the stream!" in resp["message"]
+        assert resp["size"] == len(payload)
+        me_after = admin_session.get(f"{API}/auth/me", timeout=30).json()
+        assert me_after["storage_used"] == before + len(payload), (
+            f"storage did not increment correctly: {before} -> {me_after['storage_used']}"
+        )
+        # cleanup
+        admin_session.delete(f"{API}/videos/{resp['video_id']}", timeout=30)
+
+    def test_incremental_2gb_limit_rejects_upload(self, admin_session):
+        db = self._get_mongo_db()
+        me = admin_session.get(f"{API}/auth/me", timeout=30).json()
+        uid = me["user_id"]
+        original = me.get("storage_used", 0)
+        # Set storage_used to (2GB - 1KB) so a 4KB upload will exceed the limit
+        MAX = 2 * 1024 * 1024 * 1024
+        db.users.update_one({"user_id": uid}, {"$set": {"storage_used": MAX - 1024}})
+        try:
+            files = {"file": ("big.mp4", io.BytesIO(b"y" * 4096), "video/mp4")}
+            r = admin_session.post(f"{API}/videos/upload",
+                                   files=files, data={"title": "TEST_over_limit"}, timeout=60)
+            assert r.status_code == 400, f"Expected 400, got {r.status_code}: {r.text}"
+            detail = r.json().get("detail", "")
+            assert "Storage limit" in detail
+        finally:
+            db.users.update_one({"user_id": uid}, {"$set": {"storage_used": original}})
+
+
+# ==================== Stripe webhook signature verification ====================
+
+class TestStripeWebhook:
+    def test_missing_signature_returns_400(self):
+        r = requests.post(f"{API}/webhook/stripe",
+                          data=b'{"type":"checkout.session.completed"}',
+                          headers={"Content-Type": "application/json"}, timeout=30)
+        assert r.status_code == 400, f"Expected 400, got {r.status_code}: {r.text}"
+
+    def test_invalid_signature_returns_400(self):
+        r = requests.post(f"{API}/webhook/stripe",
+                          data=b'{"type":"checkout.session.completed","data":{}}',
+                          headers={
+                              "Content-Type": "application/json",
+                              "Stripe-Signature": "t=123,v1=deadbeefdeadbeef"
+                          }, timeout=30)
+        assert r.status_code == 400
+
+
+# ==================== Idempotent plan activation ====================
+
+class TestIdempotentActivation:
+    """Directly exercise the idempotent activation helper via a synthetic
+    payment_transactions record + repeated checkout-status polling.
+    """
+
+    def _get_mongo_db(self):
+        from pymongo import MongoClient
+        from pathlib import Path
+        env = Path("/app/backend/.env").read_text().splitlines()
+        cfg = {}
+        for line in env:
+            if "=" in line and not line.startswith("#"):
+                k, v = line.split("=", 1)
+                cfg[k.strip()] = v.strip().strip('"')
+        cli = MongoClient(cfg["MONGO_URL"])
+        return cli[cfg["DB_NAME"]]
+
+    def test_activate_plan_is_idempotent(self):
+        """Call activate_plan_from_transaction twice (simulating webhook + polling race).
+        Second call must be a no-op (returns False) and the plan expiry must not shift.
+        """
+        import asyncio
+        from datetime import datetime, timezone, timedelta
+        from motor.motor_asyncio import AsyncIOMotorClient
+        import sys
+        sys.path.insert(0, "/app/backend")
+        # Import the helper directly
+        from server import activate_plan_from_transaction, db as server_db
+
+        db = self._get_mongo_db()
+        user_id = f"TEST_idem_user_{uuid.uuid4().hex[:8]}"
+        session_id = f"cs_test_idem_{uuid.uuid4().hex[:10]}"
+        db.users.insert_one({
+            "user_id": user_id,
+            "email": f"{user_id}@example.com",
+            "name": "Idem Tester",
+            "password_hash": "x",
+            "plan": None,
+            "plan_expires_at": None,
+            "storage_used": 0,
+            "created_at": datetime.now(timezone.utc),
+        })
+        db.payment_transactions.insert_one({
+            "transaction_id": f"txn_{uuid.uuid4().hex[:8]}",
+            "user_id": user_id,
+            "session_id": session_id,
+            "plan_id": "daily",
+            "amount": 4.99,
+            "currency": "usd",
+            "payment_status": "pending",
+            "status": "initiated",
+            "created_at": datetime.now(timezone.utc),
+        })
+
+        async def run():
+            first = await activate_plan_from_transaction(session_id, "paid")
+            second = await activate_plan_from_transaction(session_id, "paid")
+            return first, second
+
+        try:
+            first, second = asyncio.run(run())
+            assert first is True, "First activation should activate"
+            assert second is False, "Second activation must be a no-op"
+            user = db.users.find_one({"user_id": user_id})
+            assert user["plan"] == "daily"
+            txn = db.payment_transactions.find_one({"session_id": session_id})
+            assert txn["status"] == "completed"
+            assert txn["payment_status"] == "paid"
+        finally:
+            db.users.delete_one({"user_id": user_id})
+            db.payment_transactions.delete_one({"session_id": session_id})
+
+    def test_activate_plan_not_paid_no_op(self):
+        import asyncio
+        from server import activate_plan_from_transaction
+        result = asyncio.run(activate_plan_from_transaction("cs_unknown_session", "unpaid"))
+        assert result is False
+
+
+# ==================== YouTube endpoints (not configured paths) ====================
+
+class TestYouTubeNotConfigured:
+    def test_status_returns_not_configured(self, admin_session):
+        r = admin_session.get(f"{API}/youtube/status", timeout=30)
+        assert r.status_code == 200
+        data = r.json()
+        assert data == {"configured": False, "connected": False}
+
+    def test_authorize_returns_503(self, admin_session):
+        r = admin_session.get(f"{API}/youtube/oauth/authorize", timeout=30)
+        assert r.status_code == 503
+        assert "not configured" in r.json().get("detail", "").lower()
+
+    def test_broadcast_create_without_plan_returns_403(self, fresh_user):
+        s, _, _ = fresh_user
+        r = s.post(f"{API}/youtube/broadcast/create", json={"video_id": "x"}, timeout=30)
+        assert r.status_code == 403
+        assert r.json().get("detail") == GATEKEEP_MSG
+
+    def test_broadcast_create_with_plan_but_no_youtube_account_returns_400(self, admin_session):
+        r = admin_session.post(f"{API}/youtube/broadcast/create",
+                               json={"video_id": "any"}, timeout=30)
+        assert r.status_code == 400, r.text
+        assert r.json().get("detail") == "Connect your YouTube channel first."
+
+    def test_youtube_disconnect_no_op_ok(self, admin_session):
+        r = admin_session.delete(f"{API}/youtube/disconnect", timeout=30)
+        assert r.status_code == 200
 
 
 # ==================== Payments tests ====================

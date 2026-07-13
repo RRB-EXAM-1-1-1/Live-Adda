@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Radio, Settings as SettingsIcon, PlayCircle, StopCircle, AlertTriangle } from 'lucide-react';
+import { Radio, Settings as SettingsIcon, PlayCircle, StopCircle, AlertTriangle, Youtube, Check, ExternalLink } from 'lucide-react';
 import { Button } from '../components/ui/button';
 import { Switch } from '../components/ui/switch';
 import { Label } from '../components/ui/label';
@@ -11,28 +11,93 @@ import {
   DialogDescription,
   DialogFooter
 } from '../components/ui/dialog';
-import { liveSlotAPI } from '../services/api';
+import { liveSlotAPI, youtubeAPI, videoAPI } from '../services/api';
 import { useAuth } from '../contexts/AuthContext';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import { toast } from 'sonner';
 
 const LiveSlot = () => {
   const { user } = useAuth();
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
   const [streamStatus, setStreamStatus] = useState(null);
   const [isLive, setIsLive] = useState(false);
   const [autoRotate, setAutoRotate] = useState(true);
   const [loopVideos, setLoopVideos] = useState(true);
   const [loading, setLoading] = useState(false);
   const [showPlanDialog, setShowPlanDialog] = useState(false);
+  const [ytStatus, setYtStatus] = useState({ configured: false, connected: false, channel: null });
+  const [videos, setVideos] = useState([]);
+  const [selectedVideo, setSelectedVideo] = useState('');
+  const [ytLoading, setYtLoading] = useState(false);
 
   const hasActivePlan = user?.plan && user?.plan_expires_at;
 
   useEffect(() => {
     if (hasActivePlan) {
       loadStreamStatus();
+      loadVideos();
+    }
+    loadYoutubeStatus();
+
+    // Handle OAuth redirect result
+    const ytResult = searchParams.get('youtube');
+    if (ytResult === 'connected') {
+      toast.success('YouTube channel connected successfully!');
+      setSearchParams({});
+    } else if (ytResult === 'error') {
+      toast.error('Failed to connect YouTube channel. Please try again.');
+      setSearchParams({});
     }
   }, []);
+
+  const loadYoutubeStatus = async () => {
+    const { data } = await youtubeAPI.getStatus();
+    if (data) setYtStatus(data);
+  };
+
+  const loadVideos = async () => {
+    const { data } = await videoAPI.getAll();
+    if (data) {
+      setVideos(data);
+      if (data.length > 0) setSelectedVideo(data[0].video_id);
+    }
+  };
+
+  const handleConnectYoutube = async () => {
+    setYtLoading(true);
+    const { data, error } = await youtubeAPI.getAuthUrl();
+    setYtLoading(false);
+    if (data?.authorization_url) {
+      window.location.href = data.authorization_url;
+    } else {
+      toast.error(error || 'YouTube integration not configured yet.');
+    }
+  };
+
+  const handleDisconnectYoutube = async () => {
+    await youtubeAPI.disconnect();
+    toast.success('YouTube channel disconnected');
+    loadYoutubeStatus();
+  };
+
+  const handleGoLiveYoutube = async () => {
+    if (!selectedVideo) {
+      toast.error('Please select a video to stream');
+      return;
+    }
+    setYtLoading(true);
+    const { data, error } = await youtubeAPI.createBroadcast(selectedVideo);
+    setYtLoading(false);
+    if (data) {
+      toast.success('Broadcast started! Opening YouTube...');
+      setIsLive(true);
+      loadStreamStatus();
+      if (data.watch_url) window.open(data.watch_url, '_blank');
+    } else {
+      toast.error(error || 'Failed to start YouTube broadcast');
+    }
+  };
 
   const loadStreamStatus = async () => {
     const { data, error } = await liveSlotAPI.getStatus();
@@ -216,12 +281,81 @@ const LiveSlot = () => {
             />
           </div>
 
-          <div className="p-4 bg-blue-500/10 border border-blue-500/30 rounded-xl">
-            <h3 className="text-white font-medium mb-2">YouTube Connection</h3>
-            <p className="text-gray-400 text-sm mb-4">Connect your YouTube channel to start streaming</p>
-            <Button variant="outline" className="border-blue-500 text-blue-400 hover:bg-blue-500/10">
-              Connect YouTube
-            </Button>
+          <div className="p-4 bg-blue-500/10 border border-blue-500/30 rounded-xl" data-testid="youtube-connection-block">
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-white font-medium flex items-center">
+                <Youtube className="w-5 h-5 mr-2 text-red-500" />
+                YouTube Connection
+              </h3>
+              {ytStatus.connected && (
+                <span className="flex items-center text-emerald-400 text-sm font-medium">
+                  <Check className="w-4 h-4 mr-1" /> Connected
+                </span>
+              )}
+            </div>
+
+            {!ytStatus.configured ? (
+              <p className="text-amber-400/80 text-sm" data-testid="youtube-not-configured">
+                YouTube integration is not configured yet. Add your OAuth credentials to enable channel connection.
+              </p>
+            ) : ytStatus.connected ? (
+              <div>
+                <p className="text-gray-300 text-sm mb-3">
+                  Channel: <span className="font-semibold text-white">{ytStatus.channel?.channel_title || 'Connected'}</span>
+                </p>
+                {hasActivePlan && videos.length > 0 && (
+                  <div className="mb-3">
+                    <Label className="text-gray-400 text-sm">Select video to stream</Label>
+                    <select
+                      value={selectedVideo}
+                      onChange={(e) => setSelectedVideo(e.target.value)}
+                      className="mt-1 w-full bg-gray-700 border border-gray-600 text-white rounded-lg px-3 py-2"
+                      data-testid="youtube-video-select"
+                    >
+                      {videos.map((v) => (
+                        <option key={v.video_id} value={v.video_id}>{v.title}</option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+                <div className="flex gap-2">
+                  <Button
+                    onClick={handleGoLiveYoutube}
+                    disabled={ytLoading || !hasActivePlan || videos.length === 0}
+                    className="bg-red-600 hover:bg-red-700 text-white"
+                    data-testid="youtube-go-live-button"
+                  >
+                    <Youtube className="w-4 h-4 mr-2" />
+                    {ytLoading ? 'Starting...' : 'Go Live on YouTube'}
+                  </Button>
+                  <Button
+                    variant="outline"
+                    onClick={handleDisconnectYoutube}
+                    className="border-gray-600 text-gray-300 hover:bg-gray-700"
+                    data-testid="youtube-disconnect-button"
+                  >
+                    Disconnect
+                  </Button>
+                </div>
+                {videos.length === 0 && hasActivePlan && (
+                  <p className="text-gray-500 text-xs mt-2">Upload a video first to stream it.</p>
+                )}
+              </div>
+            ) : (
+              <div>
+                <p className="text-gray-400 text-sm mb-4">Connect your YouTube channel to start streaming</p>
+                <Button
+                  onClick={handleConnectYoutube}
+                  disabled={ytLoading}
+                  variant="outline"
+                  className="border-blue-500 text-blue-400 hover:bg-blue-500/10"
+                  data-testid="connect-youtube-button"
+                >
+                  <Youtube className="w-4 h-4 mr-2" />
+                  {ytLoading ? 'Connecting...' : 'Connect YouTube'}
+                </Button>
+              </div>
+            )}
           </div>
         </div>
       </div>

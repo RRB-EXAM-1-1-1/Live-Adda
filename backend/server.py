@@ -14,6 +14,7 @@ import bcrypt
 import jwt
 import aiofiles
 from emergentintegrations.payments.stripe.checkout import StripeCheckout, CheckoutSessionRequest
+import youtube_service
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -747,6 +748,166 @@ async def create_support_ticket(
         "ticket_id": ticket_doc["ticket_id"],
         "created_at": ticket_doc["created_at"].isoformat()
     }
+
+# ==================== YOUTUBE LIVE STREAMING ENDPOINTS ====================
+
+def _youtube_redirect_uri(request: Request) -> str:
+    """Build the OAuth redirect URI from the incoming request's base URL."""
+    base = str(request.base_url).rstrip("/")
+    return f"{base}/api/youtube/oauth/callback"
+
+@api_router.get("/youtube/status")
+async def youtube_status(user: dict = Depends(get_current_user)):
+    """Return whether the user's YouTube channel is connected."""
+    if not youtube_service.is_configured():
+        return {"configured": False, "connected": False}
+
+    account = await db.youtube_accounts.find_one({"user_id": user["user_id"]}, {"_id": 0})
+    if not account:
+        return {"configured": True, "connected": False}
+
+    channel = {
+        "channel_title": account.get("channel_title"),
+        "channel_id": account.get("channel_id"),
+        "thumbnail": account.get("thumbnail"),
+    }
+    return {"configured": True, "connected": True, "channel": channel}
+
+@api_router.get("/youtube/oauth/authorize")
+async def youtube_authorize(request: Request, user: dict = Depends(get_current_user)):
+    """Return the Google OAuth consent URL to connect the user's YouTube channel."""
+    if not youtube_service.is_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="YouTube integration not configured. Add YOUTUBE_CLIENT_ID and YOUTUBE_CLIENT_SECRET."
+        )
+    redirect_uri = _youtube_redirect_uri(request)
+    # Use user_id as state to correlate the callback
+    auth_url = youtube_service.build_authorization_url(redirect_uri, state=user["user_id"])
+    return {"authorization_url": auth_url}
+
+@api_router.get("/youtube/oauth/callback")
+async def youtube_oauth_callback(request: Request):
+    """Handle the OAuth redirect from Google, store tokens, redirect back to the app."""
+    from fastapi.responses import RedirectResponse
+
+    params = dict(request.query_params)
+    code = params.get("code")
+    state = params.get("state")  # user_id
+    base = str(request.base_url).rstrip("/")
+
+    if not code or not state:
+        return RedirectResponse(url=f"{base}/dashboard/live-slot?youtube=error")
+
+    try:
+        redirect_uri = _youtube_redirect_uri(request)
+        tokens = youtube_service.exchange_code_for_tokens(redirect_uri, code)
+
+        account_doc = {
+            "user_id": state,
+            **tokens,
+            "connected_at": datetime.now(timezone.utc),
+        }
+        # Fetch channel info for display
+        try:
+            channel = youtube_service.get_channel_info(account_doc)
+            account_doc.update(channel)
+        except Exception as e:
+            logger.error(f"Failed to fetch channel info: {e}")
+
+        await db.youtube_accounts.update_one(
+            {"user_id": state},
+            {"$set": account_doc},
+            upsert=True,
+        )
+        return RedirectResponse(url=f"{base}/dashboard/live-slot?youtube=connected")
+    except Exception as e:
+        logger.error(f"YouTube OAuth callback failed: {e}")
+        return RedirectResponse(url=f"{base}/dashboard/live-slot?youtube=error")
+
+@api_router.delete("/youtube/disconnect")
+async def youtube_disconnect(user: dict = Depends(get_current_user)):
+    """Disconnect the user's YouTube channel."""
+    await db.youtube_accounts.delete_one({"user_id": user["user_id"]})
+    return {"message": "YouTube channel disconnected"}
+
+@api_router.post("/youtube/broadcast/create")
+async def youtube_create_broadcast(request: Request, user: dict = Depends(get_current_user)):
+    """Create a YouTube live broadcast+stream, bind them, start ffmpeg push for a video."""
+    await check_active_plan(user)
+
+    account = await db.youtube_accounts.find_one({"user_id": user["user_id"]}, {"_id": 0})
+    if not account:
+        raise HTTPException(status_code=400, detail="Connect your YouTube channel first.")
+
+    body = await request.json()
+    video_id = body.get("video_id")
+    if not video_id:
+        raise HTTPException(status_code=400, detail="video_id is required")
+
+    video = await db.videos.find_one({"video_id": video_id, "user_id": user["user_id"]}, {"_id": 0})
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    try:
+        result = youtube_service.create_broadcast_and_stream(
+            account,
+            title=body.get("title", video["title"]),
+            description=body.get("description", ""),
+        )
+        # Start ffmpeg push (best-effort; requires ffmpeg installed)
+        pid = youtube_service.start_ffmpeg_push(video["file_path"], result["stream_key"], loop=True)
+
+        # Persist the live stream state
+        await db.live_streams.update_one(
+            {"user_id": user["user_id"]},
+            {"$set": {
+                "user_id": user["user_id"],
+                "is_live": True,
+                "current_video": video["title"],
+                "broadcast_id": result["broadcast_id"],
+                "stream_id": result["stream_id"],
+                "watch_url": result["watch_url"],
+                "ffmpeg_pid": pid,
+                "started_at": datetime.now(timezone.utc),
+            }},
+            upsert=True,
+        )
+        return {
+            "message": "Broadcast created and streaming started",
+            "watch_url": result["watch_url"],
+            "broadcast_id": result["broadcast_id"],
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"YouTube broadcast creation failed: {e}")
+        raise HTTPException(status_code=500, detail=f"YouTube streaming failed: {str(e)}")
+
+@api_router.post("/youtube/broadcast/stop")
+async def youtube_stop_broadcast(user: dict = Depends(get_current_user)):
+    """Stop the ffmpeg push and complete the broadcast."""
+    stream = await db.live_streams.find_one({"user_id": user["user_id"]}, {"_id": 0})
+    if not stream:
+        raise HTTPException(status_code=404, detail="No active stream")
+
+    # Stop ffmpeg
+    if stream.get("ffmpeg_pid"):
+        youtube_service.stop_ffmpeg_push(stream["ffmpeg_pid"])
+
+    # Complete broadcast on YouTube
+    account = await db.youtube_accounts.find_one({"user_id": user["user_id"]}, {"_id": 0})
+    if account and stream.get("broadcast_id"):
+        try:
+            youtube_service.transition_broadcast(account, stream["broadcast_id"], "complete")
+        except Exception as e:
+            logger.error(f"Failed to complete broadcast: {e}")
+
+    await db.live_streams.update_one(
+        {"user_id": user["user_id"]},
+        {"$set": {"is_live": False, "ffmpeg_pid": None}}
+    )
+    return {"message": "Broadcast stopped"}
 
 # ==================== DASHBOARD STATS ====================
 
