@@ -1,0 +1,44 @@
+# Live Adda - systemd template for a persistent 24/7 YouTube RTMP stream
+#
+# This keeps an ffmpeg encoder alive forever (auto-restart on crash/reboot),
+# independent of the web app. Use it for "always-on" 24/7 channels.
+#
+# Install:
+#   cp deploy/liveadda-stream@.service /etc/systemd/system/
+#   systemctl daemon-reload
+#
+# For each stream, create an env file /etc/liveadda/stream-<N>.env containing:
+#   VIDEO_PATH=/opt/live-adda/backend/uploads/videos/video_xxxx.mp4
+#   STREAM_KEY=xxxx-xxxx-xxxx-xxxx        # from YouTube (or app broadcast create)
+#
+# Then start/enable it (survives reboots):
+#   mkdir -p /etc/liveadda
+#   nano /etc/liveadda/stream-1.env
+#   systemctl enable --now liveadda-stream@1
+#
+# Check status / logs:
+#   systemctl status liveadda-stream@1
+#   journalctl -u liveadda-stream@1 -f
+
+[Unit]
+Description=Live Adda 24/7 YouTube RTMP stream %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/liveadda/stream-%i.env
+# -stream_loop -1 loops the video forever; re-encodes to a YouTube-safe H.264/AAC.
+# If your source is already H.264/AAC you can swap to "-c copy" for near-zero CPU.
+ExecStart=/usr/bin/ffmpeg -re -stream_loop -1 -i ${VIDEO_PATH} \
+    -c:v libx264 -preset veryfast -b:v 2500k -maxrate 2500k -bufsize 5000k \
+    -pix_fmt yuv420p -g 60 -c:a aac -b:a 128k -ar 44100 \
+    -f flv rtmp://a.rtmp.youtube.com/live2/${STREAM_KEY}
+Restart=always
+RestartSec=5
+# Prevent runaway restart loops from a bad file/key
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Install]
+WantedBy=multi-user.target
