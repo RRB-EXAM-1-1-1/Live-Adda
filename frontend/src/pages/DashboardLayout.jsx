@@ -12,14 +12,13 @@ import {
   User
 } from 'lucide-react';
 import { Button } from '../components/ui/button';
+import { useAuth } from '../contexts/AuthContext';
 
 const DashboardLayout = () => {
   const navigate = useNavigate();
   const location = useLocation();
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  
-  // Mock user data - in real app, this comes from auth context
-  const user = JSON.parse(localStorage.getItem('mockUser') || '{"name":"Demo User","email":"demo@example.com"}');
+  const { user, logout } = useAuth();
 
   const navigation = [
     { name: 'Dashboard', path: '/dashboard', icon: LayoutDashboard },
@@ -29,8 +28,8 @@ const DashboardLayout = () => {
     { name: 'Support', path: '/dashboard/support', icon: HelpCircle },
   ];
 
-  const handleLogout = () => {
-    localStorage.removeItem('mockUser');
+  const handleLogout = async () => {
+    await logout();
     navigate('/');
   };
 
@@ -74,8 +73,8 @@ const DashboardLayout = () => {
                 <User className="w-5 h-5 text-white" />
               </div>
               <div className="flex-1 min-w-0">
-                <p className="text-sm font-medium text-white truncate">{user.name}</p>
-                <p className="text-xs text-gray-400 truncate">{user.email}</p>
+                <p className="text-sm font-medium text-white truncate" data-testid="sidebar-user-name">{user?.name || 'User'}</p>
+                <p className="text-xs text-gray-400 truncate" data-testid="sidebar-user-email">{user?.email || ''}</p>
               </div>
             </div>
           </div>

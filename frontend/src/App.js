@@ -1,5 +1,8 @@
 import "@/App.css";
 import { BrowserRouter, Routes, Route } from "react-router-dom";
+import { AuthProvider } from "./contexts/AuthContext";
+import { ProtectedRoute } from "./components/ProtectedRoute";
+import { Toaster } from "./components/ui/sonner";
 import LandingPage from "./pages/LandingPage";
 import Login from "./pages/Login";
 import Register from "./pages/Register";
@@ -13,20 +16,23 @@ import Support from "./pages/Support";
 function App() {
   return (
     <div className="App">
-      <BrowserRouter>
-        <Routes>
-          <Route path="/" element={<LandingPage />} />
-          <Route path="/login" element={<Login />} />
-          <Route path="/register" element={<Register />} />
-          <Route path="/dashboard" element={<DashboardLayout />}>
-            <Route index element={<Dashboard />} />
-            <Route path="videos" element={<VideoManager />} />
-            <Route path="live-slot" element={<LiveSlot />} />
-            <Route path="billings" element={<Billings />} />
-            <Route path="support" element={<Support />} />
-          </Route>
-        </Routes>
-      </BrowserRouter>
+      <AuthProvider>
+        <BrowserRouter>
+          <Routes>
+            <Route path="/" element={<LandingPage />} />
+            <Route path="/login" element={<Login />} />
+            <Route path="/register" element={<Register />} />
+            <Route path="/dashboard" element={<ProtectedRoute><DashboardLayout /></ProtectedRoute>}>
+              <Route index element={<Dashboard />} />
+              <Route path="videos" element={<VideoManager />} />
+              <Route path="live-slot" element={<LiveSlot />} />
+              <Route path="billings" element={<Billings />} />
+              <Route path="support" element={<Support />} />
+            </Route>
+          </Routes>
+          <Toaster position="top-right" />
+        </BrowserRouter>
+      </AuthProvider>
     </div>
   );
 }

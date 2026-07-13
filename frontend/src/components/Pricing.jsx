@@ -3,15 +3,19 @@ import { Button } from './ui/button';
 import { Check } from 'lucide-react';
 import { mockPlans } from '../mock';
 import { useNavigate } from 'react-router-dom';
+import { useAuth } from '../contexts/AuthContext';
 
 export const Pricing = () => {
   const navigate = useNavigate();
+  const { isAuthenticated } = useAuth();
   const [hoveredPlan, setHoveredPlan] = useState(null);
 
   const handlePurchase = (planId) => {
-    // Mock: In real app, this will navigate to checkout
-    console.log('Purchasing plan:', planId);
-    navigate('/register');
+    if (isAuthenticated) {
+      navigate('/dashboard/billings');
+    } else {
+      navigate('/register');
+    }
   };
 
   return (
@@ -79,6 +83,7 @@ export const Pricing = () => {
                   {/* CTA Button */}
                   <Button
                     onClick={() => handlePurchase(plan.id)}
+                    data-testid={`landing-buy-${plan.id}`}
                     className={`w-full py-6 text-lg font-semibold rounded-xl transition-all ${
                       isPopular || isBestValue
                         ? 'bg-gradient-to-r from-emerald-500 to-emerald-600 hover:from-emerald-600 hover:to-emerald-700 text-white shadow-md hover:shadow-xl'

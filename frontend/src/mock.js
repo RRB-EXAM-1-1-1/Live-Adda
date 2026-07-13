@@ -5,12 +5,12 @@ export const mockPlans = [
     id: 'daily',
     name: 'Daily',
     price: 4.99,
-    duration: '1 Day',
+    duration: '24 Hours',
     badge: null,
     features: [
       '1 Active Live Slot',
       '24/7 Continuous Stream',
-      '5GB Video Storage',
+      '2GB Video Storage',
       'Standard Support'
     ]
   },
@@ -23,7 +23,7 @@ export const mockPlans = [
     features: [
       '1 Active Live Slot',
       '24/7 Continuous Stream',
-      '10GB Video Storage',
+      '2GB Video Storage',
       'Priority Support'
     ]
   },
@@ -34,9 +34,9 @@ export const mockPlans = [
     duration: '30 Days',
     badge: 'Best Value',
     features: [
-      '2 Active Live Slots',
+      '1 Active Live Slot',
       '24/7 Continuous Stream',
-      '25GB Video Storage',
+      '2GB Video Storage',
       'Priority Support',
       'Advanced Analytics'
     ]

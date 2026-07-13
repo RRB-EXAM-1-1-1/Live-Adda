@@ -2,9 +2,12 @@ import React from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { Button } from './ui/button';
 import { Radio } from 'lucide-react';
+import { useAuth } from '../contexts/AuthContext';
 
-export const Navbar = ({ isLoggedIn = false, user = null }) => {
+export const Navbar = () => {
   const navigate = useNavigate();
+  const { isAuthenticated, user } = useAuth();
+  const isLoggedIn = isAuthenticated;
 
   return (
     <nav className="fixed top-0 left-0 right-0 z-50 bg-white/80 backdrop-blur-lg border-b border-gray-200">

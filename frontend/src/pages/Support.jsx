@@ -4,17 +4,28 @@ import { Button } from '../components/ui/button';
 import { Input } from '../components/ui/input';
 import { Label } from '../components/ui/label';
 import { Textarea } from '../components/ui/textarea';
+import { supportAPI } from '../services/api';
+import { toast } from 'sonner';
 
 const Support = () => {
   const [formData, setFormData] = useState({
     subject: '',
     message: ''
   });
+  const [submitting, setSubmitting] = useState(false);
 
-  const handleSubmit = (e) => {
+  const handleSubmit = async (e) => {
     e.preventDefault();
-    alert('Support ticket submitted successfully! We\'ll get back to you soon.');
-    setFormData({ subject: '', message: '' });
+    setSubmitting(true);
+    const { data, error } = await supportAPI.createTicket(formData.subject, formData.message);
+    setSubmitting(false);
+
+    if (data) {
+      toast.success('Support ticket submitted successfully! We\'ll get back to you soon.');
+      setFormData({ subject: '', message: '' });
+    } else {
+      toast.error(error || 'Failed to submit ticket');
+    }
   };
 
   const faqs = [
@@ -100,10 +111,12 @@ const Support = () => {
           </div>
           <Button 
             type="submit"
+            disabled={submitting}
+            data-testid="submit-ticket-button"
             className="bg-gradient-to-r from-blue-600 to-blue-700 hover:from-blue-700 hover:to-blue-800 text-white"
           >
             <Send className="w-4 h-4 mr-2" />
-            Submit Ticket
+            {submitting ? 'Submitting...' : 'Submit Ticket'}
           </Button>
         </form>
       </div>

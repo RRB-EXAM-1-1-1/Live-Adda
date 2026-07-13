@@ -4,9 +4,11 @@ import { Button } from '../components/ui/button';
 import { Input } from '../components/ui/input';
 import { Label } from '../components/ui/label';
 import { Radio, Mail, Lock, User, Eye, EyeOff } from 'lucide-react';
+import { useAuth } from '../contexts/AuthContext';
 
 const Register = () => {
   const navigate = useNavigate();
+  const { register } = useAuth();
   const [formData, setFormData] = useState({
     name: '',
     email: '',
@@ -16,6 +18,7 @@ const Register = () => {
   const [showPassword, setShowPassword] = useState(false);
   const [showConfirmPassword, setShowConfirmPassword] = useState(false);
   const [error, setError] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
 
   const handleChange = (e) => {
     setFormData({ ...formData, [e.target.name]: e.target.value });
@@ -42,10 +45,15 @@ const Register = () => {
       return;
     }
 
-    // Mock registration - In real app, this will call backend API
-    console.log('Registering:', formData);
-    localStorage.setItem('mockUser', JSON.stringify({ name: formData.name, email: formData.email }));
-    navigate('/dashboard');
+    setIsLoading(true);
+    const result = await register(formData.email, formData.password, formData.name);
+    setIsLoading(false);
+
+    if (result.success) {
+      navigate('/dashboard');
+    } else {
+      setError(result.error || 'Registration failed');
+    }
   };
 
   const handleGoogleAuth = () => {
@@ -185,9 +193,11 @@ const Register = () => {
 
             <Button
               type="submit"
+              disabled={isLoading}
+              data-testid="register-submit-button"
               className="w-full py-6 text-base font-semibold bg-gradient-to-r from-emerald-500 to-emerald-600 hover:from-emerald-600 hover:to-emerald-700 text-white shadow-md hover:shadow-lg transition-all"
             >
-              Create Account
+              {isLoading ? 'Creating Account...' : 'Create Account'}
             </Button>
           </form>
 

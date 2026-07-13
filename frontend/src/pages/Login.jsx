@@ -4,12 +4,15 @@ import { Button } from '../components/ui/button';
 import { Input } from '../components/ui/input';
 import { Label } from '../components/ui/label';
 import { Radio, Mail, Lock, Eye, EyeOff } from 'lucide-react';
+import { useAuth } from '../contexts/AuthContext';
 
 const Login = () => {
   const navigate = useNavigate();
+  const { login } = useAuth();
   const [formData, setFormData] = useState({ email: '', password: '' });
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
 
   const handleChange = (e) => {
     setFormData({ ...formData, [e.target.name]: e.target.value });
@@ -25,10 +28,15 @@ const Login = () => {
       return;
     }
 
-    // Mock login - In real app, this will call backend API
-    console.log('Logging in:', formData);
-    localStorage.setItem('mockUser', JSON.stringify({ name: 'Demo User', email: formData.email }));
-    navigate('/dashboard');
+    setIsLoading(true);
+    const result = await login(formData.email, formData.password);
+    setIsLoading(false);
+
+    if (result.success) {
+      navigate('/dashboard');
+    } else {
+      setError(result.error || 'Login failed');
+    }
   };
 
   const handleGoogleAuth = () => {
@@ -87,7 +95,7 @@ const Login = () => {
           )}
 
           {/* Login Form */}
-          <form onSubmit={handleSubmit} className="space-y-5">
+          <form onSubmit={handleSubmit} className="space-y-5" data-testid="login-form">
             <div>
               <Label htmlFor="email" className="text-gray-700 font-medium">Email Address</Label>
               <div className="relative mt-1">
@@ -99,6 +107,7 @@ const Login = () => {
                   placeholder="you@example.com"
                   value={formData.email}
                   onChange={handleChange}
+                  data-testid="login-email-input"
                   className="pl-10 py-6 bg-gray-50 border-gray-200 focus:border-blue-500 focus:ring-blue-500 transition-all"
                 />
               </div>
@@ -120,6 +129,7 @@ const Login = () => {
                   placeholder="••••••••"
                   value={formData.password}
                   onChange={handleChange}
+                  data-testid="login-password-input"
                   className="pl-10 pr-10 py-6 bg-gray-50 border-gray-200 focus:border-blue-500 focus:ring-blue-500 transition-all"
                 />
                 <button
@@ -134,9 +144,11 @@ const Login = () => {
 
             <Button
               type="submit"
+              disabled={isLoading}
+              data-testid="login-submit-button"
               className="w-full py-6 text-base font-semibold bg-gradient-to-r from-emerald-500 to-emerald-600 hover:from-emerald-600 hover:to-emerald-700 text-white shadow-md hover:shadow-lg transition-all"
             >
-              Sign In
+              {isLoading ? 'Signing In...' : 'Sign In'}
             </Button>
           </form>
 
