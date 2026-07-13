@@ -54,6 +54,20 @@ Build "Live Adda" - a professional 24/7 YouTube Live streaming SaaS platform.
 - Scopes: youtube.force-ssl, youtube, youtube.readonly
 - 24/7 persistent ffmpeg needs dedicated VPS (Hetzner CX22 / DO Droplet)
 
+## Iteration 3 (2026-07-13) - Deploy docs + Mobile + Upload + Key Activation
+- Deployed to production (liveadda.org) with HTTPS; added deploy/ (setup.sh, nginx.conf, supervisor, systemd ffmpeg template, README.md, DEPLOYMENT.md) + .env.example files
+- Added PUBLIC_APP_URL env for deterministic OAuth redirect in production
+- Mobile responsiveness fixed: Navbar (links hidden on mobile, compact buttons), Hero (responsive text/padding, full-width CTAs), dashboard heading clears hamburger; verified no horizontal overflow at 390px
+- Upload speed optimized: 8MB streaming chunks + nginx proxy_request_buffering off
+- NEW FEATURE Key Activation: /api/stream/start-with-key + /api/stream/stop (idempotent) — active-plan users paste a YouTube stream key + pick a video to go live; UI card in Live Slot
+- Testing: 44/44 backend tests pass, frontend responsive + key-activation flows verified
+
+## Backlog (non-blocking, from test reports)
+- Split server.py (~1100 lines) into APIRouter modules
+- Migrate FastAPI on_event -> lifespan handler
+- ffmpeg liveness reaper to flip is_live=false when encoder dies
+- Redact stream key in ffmpeg logs
+
 ## Prioritized Backlog
 ### P1
 - Stream file uploads (avoid loading full 2GB into RAM)

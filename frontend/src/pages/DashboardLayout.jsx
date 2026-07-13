@@ -43,6 +43,7 @@ const DashboardLayout = () => {
           variant="outline"
           size="icon"
           onClick={() => setSidebarOpen(!sidebarOpen)}
+          data-testid="mobile-sidebar-toggle"
           className="bg-gray-800 border-gray-700 text-white hover:bg-gray-700"
         >
           {sidebarOpen ? <X className="w-5 h-5" /> : <Menu className="w-5 h-5" />}
@@ -122,7 +123,7 @@ const DashboardLayout = () => {
 
       {/* Main Content */}
       <main className="lg:ml-64 min-h-screen">
-        <div className="p-6 lg:p-8">
+        <div className="p-6 lg:p-8 pt-20 lg:pt-8">
           <Outlet />
         </div>
       </main>

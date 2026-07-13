@@ -980,10 +980,10 @@ async def start_stream_with_key(data: StreamKeyStart, user: dict = Depends(get_c
 
 @api_router.post("/stream/stop")
 async def stop_stream_with_key(user: dict = Depends(get_current_user)):
-    """Stop the manual-key stream (kills the ffmpeg push)."""
+    """Stop the manual-key stream (kills the ffmpeg push). Idempotent."""
     stream = await db.live_streams.find_one({"user_id": user["user_id"]}, {"_id": 0})
     if not stream or not stream.get("is_live"):
-        raise HTTPException(status_code=404, detail="No active stream")
+        return {"message": "Already stopped"}
 
     if stream.get("ffmpeg_pid"):
         youtube_service.stop_ffmpeg_push(stream["ffmpeg_pid"])
