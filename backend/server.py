@@ -321,25 +321,54 @@ async def upload_video(
     title: str = Form(...),
     user: dict = Depends(get_current_user)
 ):
-    """Upload video with chunking support"""
+    """Upload video with streaming/chunked write to safely handle files up to 2GB"""
     # Check active plan
     await check_active_plan(user)
-    
-    # Check storage limit
-    file_size = 0
-    content = await file.read()
-    file_size = len(content)
-    
-    await check_storage_limit(user, file_size)
-    
-    # Save video file
+
+    # Remaining storage budget for this user (2GB - already used)
+    current_storage = user.get("storage_used", 0)
+    remaining_budget = MAX_STORAGE_BYTES - current_storage
+    if remaining_budget <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Storage limit reached. You have a {MAX_STORAGE_BYTES / (1024**3):.0f} GB limit."
+        )
+
+    # Prepare destination
     video_id = f"video_{uuid.uuid4().hex[:12]}"
     file_extension = Path(file.filename).suffix
     file_path = UPLOAD_DIR / f"{video_id}{file_extension}"
-    
-    async with aiofiles.open(file_path, 'wb') as f:
-        await f.write(content)
-    
+
+    # Stream file to disk in 1MB chunks, enforcing the storage limit incrementally
+    CHUNK_SIZE = 1024 * 1024  # 1 MB
+    file_size = 0
+    try:
+        async with aiofiles.open(file_path, 'wb') as f:
+            while True:
+                chunk = await file.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                file_size += len(chunk)
+                # Enforce 2GB limit mid-stream; abort if exceeded
+                if file_size > remaining_budget:
+                    await f.close()
+                    if file_path.exists():
+                        file_path.unlink()
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Storage limit exceeded. You have {MAX_STORAGE_BYTES / (1024**3):.0f} GB limit. "
+                               f"Current usage: {current_storage / (1024**3):.2f} GB"
+                    )
+                await f.write(chunk)
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Clean up partial file on any failure
+        if file_path.exists():
+            file_path.unlink()
+        logger.error(f"Upload failed: {e}")
+        raise HTTPException(status_code=500, detail="Upload failed. Please try again.")
+
     # Create video document
     video_doc = {
         "video_id": video_id,
@@ -570,12 +599,51 @@ async def create_checkout_session(
         "checkout_url": session.url
     }
 
+async def activate_plan_from_transaction(session_id: str, payment_status: str) -> bool:
+    """Idempotently activate a user's plan for a paid session.
+    Returns True if the plan was activated by this call, False otherwise.
+    Uses an atomic conditional update so parallel webhook + polling requests
+    never activate/credit the same session twice.
+    """
+    if payment_status != "paid":
+        return False
+
+    # Atomic guard: only transition initiated/pending -> completed once
+    result = await db.payment_transactions.update_one(
+        {"session_id": session_id, "status": {"$ne": "completed"}},
+        {"$set": {
+            "payment_status": "paid",
+            "status": "completed",
+            "completed_at": datetime.now(timezone.utc)
+        }}
+    )
+
+    if result.modified_count == 0:
+        # Already processed by another request
+        return False
+
+    # Load transaction to get user + plan
+    transaction = await db.payment_transactions.find_one({"session_id": session_id}, {"_id": 0})
+    if not transaction:
+        return False
+
+    plan_id = transaction["plan_id"]
+    plan = PLANS[plan_id]
+    expires_at = datetime.now(timezone.utc) + timedelta(days=plan["duration_days"])
+
+    await db.users.update_one(
+        {"user_id": transaction["user_id"]},
+        {"$set": {"plan": plan_id, "plan_expires_at": expires_at}}
+    )
+    logger.info(f"Plan '{plan_id}' activated for user {transaction['user_id']} via session {session_id}")
+    return True
+
 @api_router.get("/payments/checkout-status/{session_id}")
 async def get_checkout_status(
     session_id: str,
     user: dict = Depends(get_current_user)
 ):
-    """Get payment status and update user plan"""
+    """Get payment status and update user plan (polling fallback)"""
     # Get transaction
     transaction = await db.payment_transactions.find_one(
         {"session_id": session_id, "user_id": user["user_id"]},
@@ -593,32 +661,9 @@ async def get_checkout_status(
     stripe_checkout = StripeCheckout(api_key=STRIPE_API_KEY, webhook_url="")
     status_response = await stripe_checkout.get_checkout_status(session_id)
     
-    # Update transaction
-    if status_response.payment_status == "paid" and transaction["status"] != "completed":
-        plan_id = transaction["plan_id"]
-        plan = PLANS[plan_id]
-        
-        # Update user plan
-        expires_at = datetime.now(timezone.utc) + timedelta(days=plan["duration_days"])
-        
-        await db.users.update_one(
-            {"user_id": user["user_id"]},
-            {"$set": {
-                "plan": plan_id,
-                "plan_expires_at": expires_at
-            }}
-        )
-        
-        # Update transaction
-        await db.payment_transactions.update_one(
-            {"session_id": session_id},
-            {"$set": {
-                "payment_status": "paid",
-                "status": "completed",
-                "completed_at": datetime.now(timezone.utc)
-            }}
-        )
-        
+    # Idempotently activate plan if paid
+    activated = await activate_plan_from_transaction(session_id, status_response.payment_status)
+    if activated or status_response.payment_status == "paid":
         transaction["payment_status"] = "paid"
         transaction["status"] = "completed"
     
@@ -626,11 +671,25 @@ async def get_checkout_status(
 
 @api_router.post("/webhook/stripe")
 async def stripe_webhook(request: Request):
-    """Handle Stripe webhooks"""
+    """Handle Stripe webhooks with signature verification.
+    Acts as a reliable backup to frontend polling for plan activation."""
     body = await request.body()
     signature = request.headers.get("Stripe-Signature")
-    
-    # Process webhook (simplified for now)
+
+    stripe_checkout = StripeCheckout(api_key=STRIPE_API_KEY, webhook_url="")
+    try:
+        webhook_response = await stripe_checkout.handle_webhook(body, signature)
+    except Exception as e:
+        logger.error(f"Stripe webhook verification failed: {e}")
+        raise HTTPException(status_code=400, detail="Invalid webhook signature")
+
+    # Activate plan idempotently on paid event
+    if webhook_response.session_id:
+        await activate_plan_from_transaction(
+            webhook_response.session_id,
+            webhook_response.payment_status
+        )
+
     return {"received": True}
 
 # ==================== BILLING ENDPOINTS ====================
