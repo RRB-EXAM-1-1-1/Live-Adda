@@ -855,8 +855,16 @@ async def youtube_create_broadcast(request: Request, user: dict = Depends(get_cu
             title=body.get("title", video["title"]),
             description=body.get("description", ""),
         )
-        # Start ffmpeg push (best-effort; requires ffmpeg installed)
-        pid = youtube_service.start_ffmpeg_push(video["file_path"], result["stream_key"], loop=True)
+        # Start ffmpeg push (roll back the broadcast if the encoder fails to start)
+        try:
+            pid = youtube_service.start_ffmpeg_push(video["file_path"], result["stream_key"], loop=True)
+        except Exception as ff_err:
+            logger.error(f"ffmpeg failed to start, completing broadcast {result['broadcast_id']}: {ff_err}")
+            try:
+                youtube_service.transition_broadcast(account, result["broadcast_id"], "complete")
+            except Exception:
+                pass
+            raise HTTPException(status_code=500, detail="Failed to start the video encoder. Broadcast cancelled.")
 
         # Persist the live stream state
         await db.live_streams.update_one(

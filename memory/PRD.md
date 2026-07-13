@@ -41,6 +41,19 @@ Build "Live Adda" - a professional 24/7 YouTube Live streaming SaaS platform.
 - Landing page (hero, features, pricing), dark dashboard, responsive + animations
 - Testing: 28/28 backend tests pass, frontend flows verified
 
+## Iteration 2 (2026-07-13) - Robustness + YouTube
+- Streaming/chunked video upload (1MB chunks) with incremental 2GB enforcement + partial-file cleanup
+- Hardened Stripe webhook: signature verification (400 on invalid) + idempotent atomic plan activation as backup to polling
+- YouTube Live integration (youtube_service.py): OAuth2 connect flow, liveBroadcast+liveStream create/bind, ffmpeg RTMP push, broadcast transition; graceful "not configured" state until YOUTUBE_CLIENT_ID/SECRET set
+- ffmpeg installed; broadcast rolls back (transition to complete) if encoder fails to start
+- Testing: 39/39 backend tests pass
+
+## Pending User Action for YouTube
+- Provide YOUTUBE_CLIENT_ID + YOUTUBE_CLIENT_SECRET (Google Cloud, YouTube Data API v3 enabled)
+- Redirect URI to whitelist: {app}/api/youtube/oauth/callback
+- Scopes: youtube.force-ssl, youtube, youtube.readonly
+- 24/7 persistent ffmpeg needs dedicated VPS (Hetzner CX22 / DO Droplet)
+
 ## Prioritized Backlog
 ### P1
 - Stream file uploads (avoid loading full 2GB into RAM)
