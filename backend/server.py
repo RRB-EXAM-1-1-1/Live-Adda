@@ -91,6 +91,11 @@ class LiveSlotSettings(BaseModel):
     auto_rotate: bool
     loop_videos: bool
 
+class StreamKeyStart(BaseModel):
+    video_id: str
+    stream_key: str
+    loop: bool = True
+
 class SupportTicket(BaseModel):
     subject: str
     message: str
@@ -340,8 +345,8 @@ async def upload_video(
     file_extension = Path(file.filename).suffix
     file_path = UPLOAD_DIR / f"{video_id}{file_extension}"
 
-    # Stream file to disk in 1MB chunks, enforcing the storage limit incrementally
-    CHUNK_SIZE = 1024 * 1024  # 1 MB
+    # Stream file to disk in 8MB chunks, enforcing the storage limit incrementally
+    CHUNK_SIZE = 8 * 1024 * 1024  # 8 MB - fewer awaits = faster throughput
     file_size = 0
     try:
         async with aiofiles.open(file_path, 'wb') as f:
@@ -924,6 +929,70 @@ async def youtube_stop_broadcast(user: dict = Depends(get_current_user)):
         {"$set": {"is_live": False, "ffmpeg_pid": None}}
     )
     return {"message": "Broadcast stopped"}
+
+# ==================== STREAM WITH KEY (Key Activation) ====================
+
+@api_router.post("/stream/start-with-key")
+async def start_stream_with_key(data: StreamKeyStart, user: dict = Depends(get_current_user)):
+    """Go live by entering a YouTube stream key directly (no OAuth needed).
+    Requires an active plan (slot). Pushes the selected video to YouTube RTMP."""
+    # Gatekeeping: must have an active plan/slot
+    await check_active_plan(user)
+
+    stream_key = data.stream_key.strip()
+    if not stream_key:
+        raise HTTPException(status_code=400, detail="Stream key is required")
+
+    video = await db.videos.find_one(
+        {"video_id": data.video_id, "user_id": user["user_id"]}, {"_id": 0}
+    )
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    # If a stream is already running, stop it first to avoid orphan ffmpeg
+    existing = await db.live_streams.find_one({"user_id": user["user_id"]}, {"_id": 0})
+    if existing and existing.get("ffmpeg_pid"):
+        youtube_service.stop_ffmpeg_push(existing["ffmpeg_pid"])
+
+    try:
+        pid = youtube_service.start_ffmpeg_push(video["file_path"], stream_key, loop=data.loop)
+    except Exception as e:
+        logger.error(f"Failed to start ffmpeg with key: {e}")
+        raise HTTPException(status_code=500, detail="Failed to start the video encoder.")
+
+    await db.live_streams.update_one(
+        {"user_id": user["user_id"]},
+        {"$set": {
+            "user_id": user["user_id"],
+            "is_live": True,
+            "current_video": video["title"],
+            "stream_method": "manual_key",
+            "ffmpeg_pid": pid,
+            "started_at": datetime.now(timezone.utc),
+        }},
+        upsert=True,
+    )
+    return {
+        "message": "You are now live on YouTube!",
+        "current_video": video["title"],
+        "watch_hint": "Open YouTube Studio to view your live stream."
+    }
+
+@api_router.post("/stream/stop")
+async def stop_stream_with_key(user: dict = Depends(get_current_user)):
+    """Stop the manual-key stream (kills the ffmpeg push)."""
+    stream = await db.live_streams.find_one({"user_id": user["user_id"]}, {"_id": 0})
+    if not stream or not stream.get("is_live"):
+        raise HTTPException(status_code=404, detail="No active stream")
+
+    if stream.get("ffmpeg_pid"):
+        youtube_service.stop_ffmpeg_push(stream["ffmpeg_pid"])
+
+    await db.live_streams.update_one(
+        {"user_id": user["user_id"]},
+        {"$set": {"is_live": False, "ffmpeg_pid": None}}
+    )
+    return {"message": "Stream stopped"}
 
 # ==================== DASHBOARD STATS ====================
 

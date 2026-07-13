@@ -1,0 +1,49 @@
+{
+  "summary": "Iteration 3: 44/44 pytest backend tests pass (added 5 new tests for Key Activation feature — /api/stream/start-with-key + /api/stream/stop; refreshed 2 YouTube-status tests to match environment now that YOUTUBE_CLIENT_ID/SECRET are populated). Frontend UI validated at mobile viewport 390x844: landing has no horizontal overflow, Features/Pricing nav links correctly hidden on mobile, Login/Get Started buttons visible; dashboard sidebar starts hidden (-translate-x-full) and hamburger toggle (top-left) slides it in (left: -256 -> 0) on click; LiveSlot page renders stream-key-card with key-video-select + stream-key-input + start-with-key-button for active-plan user, submitting a fake key returns success toast 'You are now live on YouTube!', UI swaps to stop-key-stream-button, and Stop reverts to Start. No-plan user sees the amber 'Activate a plan/slot to unlock streaming' notice with 'View Plans' CTA — inputs are correctly not rendered. All iteration 1+2 regressions still pass (auth, gatekeeping exact message, videos CRUD/rename/delete + storage decrement, streaming upload + incremental 2GB limit, Stripe webhook signature verification, idempotent plan activation, YouTube configured/authorize paths, checkout session/status/invalid plan, billings, support, dashboard stats, live-slot start/stop/settings).",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "/api/stream/start-with-key", "issue": "No ffmpeg liveness check after spawn — with a fake/invalid stream key ffmpeg exits within 1-2s (expected here), but the live_streams document still reads is_live=true and current_video=... indefinitely until user manually stops. Consider a background reaper that polls os.kill(pid, 0) and flips is_live to false when the process dies."},
+      {"endpoint": "/api/stream/start-with-key", "issue": "Regular /api/live-slot/start (existing) and /api/stream/start-with-key both write to db.live_streams for the same user but with different fields (stream_key vs internal loop). If a user runs both paths back-to-back they update the same doc. This works today because start-with-key stops any existing ffmpeg first, but a defensive assertion (stream_method != 'youtube_oauth') might avoid confusing state."},
+      {"endpoint": "/api/stream/stop", "issue": "Currently returns 404 'No active stream' if is_live is already false. That's spec-correct, but the frontend calls this via youtubeAPI.stopStream() from BOTH handleStopKeyStream and the OAuth flow; a 404 during the OAuth flow will surface an unnecessary error toast to the user. Consider making stop idempotent (return 200 with 'Already stopped' when no active record)."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [
+      {"screen": "Dashboard mobile (Live Slot)", "issues": ["The 'Live Slot Management' page heading is partially covered by the fixed hamburger button (top-left, z-50) at 390px viewport. Consider adding pl-16 or pt-16 to the main content wrapper on lg:hidden, or push the heading below the toggle."]},
+      {"screen": "LiveSlot page (no-plan user)", "issues": ["The top-level 'Live Slot #1' card still exposes a green 'Start Streaming' button even though gating is enforced at the backend. It would be a better UX to visually disable this button (or hide it) when hasActivePlan is false, matching how the stream-key-card behaves — consistency with the amber notice pattern."]}
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/backend_test.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "(Nice-to-have) Make POST /api/stream/stop idempotent (return 200 when nothing is live) so double-clicks / cross-flow calls don't emit spurious error toasts.",
+    "(Nice-to-have) Add a lightweight ffmpeg liveness reaper so live_streams.is_live reflects reality when ffmpeg dies on its own (fake key, network drop, YouTube revoke).",
+    "(UX) On mobile Live Slot page, offset the main content by the hamburger button's height so the page heading is not partially covered by the fixed top-left toggle.",
+    "(UX) Also gate the top-level 'Start Streaming' button on LiveSlot for no-plan users (currently only the stream-key-card branches on hasActivePlan)."
+  ],
+  "critical_code_review_comments": [
+    "server.py has grown to ~1094 lines — recommend splitting into APIRouter modules (auth, videos, payments, youtube, live_slot, stream_with_key, billings, support, dashboard). Iteration 2 flagged this too; still applies.",
+    "start-with-key correctly stops any existing ffmpeg PID before spawning a new one — prevents orphan processes.",
+    "start_ffmpeg_push failure is wrapped in try/except and surfaces as HTTP 500 with a generic 'Failed to start the video encoder' message — good.",
+    "CHUNK_SIZE bumped 1MB -> 8MB in upload_video is a safe optimization (still incremental storage-checked per chunk). The 2GB enforcement test with pre-seeded storage_used still passes.",
+    "on_event('startup'/'shutdown') is still deprecated in FastAPI — should migrate to lifespan handler (also flagged in iteration 2).",
+    "Frontend Navbar/Hero mobile-first tweaks are correct: 'hidden md:inline' on Features/Pricing, 'w-full sm:w-auto' on Hero CTAs, responsive text/padding — validated at 390x844 with no horizontal overflow.",
+    "DashboardLayout hamburger toggle button (line 42-49) has NO data-testid — added test worked around it via 'button:has(svg.lucide-menu)' but this should get a data-testid='mobile-sidebar-toggle' for maintainability.",
+    "youtube_service.start_ffmpeg_push writes ffmpeg logs to /tmp/ffmpeg_<key_prefix>.log — key prefix in filename is fine but the log itself contains the full rtmp URL including the key. Consider redacting the key in the ffmpeg command log/output when spawning."
+  ],
+  "updated_files": [
+    "/app/backend/tests/backend_test.py"
+  ],
+  "success_rate": {"backend": "100% (44/44)", "frontend": "100% (landing responsive, mobile sidebar toggle, key activation flow with-plan + no-plan)"},
+  "test_credentials": "Admin: admin@liveadda.com / admin123 (monthly plan seeded on startup). Fresh users generated per-test with TEST_ prefix. Frontend UI test used a fresh account with plan seeded via Mongo (mongo update on plan + plan_expires_at + upload one small MP4). All test data cleaned up post-run.",
+  "seed_data_creation": "Backend test class TestKeyActivation uses a new fixture key_user (class-scoped) that registers a fresh TEST_keyuser_* account, seeds plan='daily' + plan_expires_at=now+1day via pymongo, and tears down (deletes user + videos + live_streams) on class finalization. Frontend seeded ui_keyuser_d285df@example.com / testpass1 with a video 'UI Test Video' for the UI flow, then cleaned via a mongo delete.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Iteration 3 backend has two new endpoints: POST /api/stream/start-with-key (StreamKeyStart{video_id,stream_key,loop}) and POST /api/stream/stop. Both require an active plan (gatekeep returns 403 with the exact ⚠️ message). With a fake stream key ffmpeg exits ~1s later — this is EXPECTED, do NOT attempt to verify a real YouTube live. Backend YOUTUBE_CLIENT_ID/SECRET are now populated in /app/backend/.env (contrast with iteration 2 which tested the 'not configured' paths); TestYouTubeNotConfigured has been updated accordingly — /api/youtube/status -> {configured:true, connected:false}, /api/youtube/oauth/authorize -> 200 with an authorization_url pointing at accounts.google.com. Frontend LiveSlot has a new data-testid='stream-key-card' with key-video-select / stream-key-input / start-with-key-button / stop-key-stream-button. Amber notice text 'Activate a plan/slot to unlock streaming' is shown when hasActivePlan is false. The dashboard hamburger toggle at lg:hidden has NO data-testid — add data-testid='mobile-sidebar-toggle' next iteration. pytest.ini enforces -n 2 --dist loadscope, so any new tests that mutate admin state should use a dedicated seeded fixture (see key_user fixture) to avoid parallel races with TestStorageEnforcement / TestVideos.",
+  "rca of the issue": "N/A — no bugs found in iteration 3. Two pre-existing tests started failing because the environment gained real YOUTUBE_CLIENT_ID/SECRET between iteration 2 and 3; the tests (TestYouTubeNotConfigured) were updated to reflect the new configured state — this is a test-side environment sync, not an app regression. One new-test flake (test_upload_returns_ready_and_increments_storage seeing storage go 0 -> 18432 instead of 16384) was root-caused to a parallel-execution race with my new TestKeyActivation class which was uploading against the same admin session concurrently; fix was to give TestKeyActivation its own key_user fixture with an independently-seeded plan, isolating admin state from cross-class races. After that fix, all 44 tests pass repeatably."
+}

@@ -267,6 +267,28 @@ export const youtubeAPI = {
     } catch (error) {
       return { data: null, error: formatApiError(error) };
     }
+  },
+
+  startWithKey: async (videoId, streamKey, loop = true) => {
+    try {
+      const { data } = await api.post('/stream/start-with-key', {
+        video_id: videoId,
+        stream_key: streamKey,
+        loop
+      });
+      return { data, error: null };
+    } catch (error) {
+      return { data: null, error: formatApiError(error) };
+    }
+  },
+
+  stopStream: async () => {
+    try {
+      const { data } = await api.post('/stream/stop');
+      return { data, error: null };
+    } catch (error) {
+      return { data: null, error: formatApiError(error) };
+    }
   }
 };
 

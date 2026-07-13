@@ -11,6 +11,7 @@ import {
   DialogDescription,
   DialogFooter
 } from '../components/ui/dialog';
+import { Input } from '../components/ui/input';
 import { liveSlotAPI, youtubeAPI, videoAPI } from '../services/api';
 import { useAuth } from '../contexts/AuthContext';
 import { useNavigate, useSearchParams } from 'react-router-dom';
@@ -30,8 +31,50 @@ const LiveSlot = () => {
   const [videos, setVideos] = useState([]);
   const [selectedVideo, setSelectedVideo] = useState('');
   const [ytLoading, setYtLoading] = useState(false);
+  // Key Activation feature
+  const [streamKey, setStreamKey] = useState('');
+  const [keyVideo, setKeyVideo] = useState('');
+  const [keyLoading, setKeyLoading] = useState(false);
 
   const hasActivePlan = user?.plan && user?.plan_expires_at;
+
+  const handleStartWithKey = async () => {
+    if (!hasActivePlan) {
+      setShowPlanDialog(true);
+      return;
+    }
+    if (!keyVideo) {
+      toast.error('Please select a video to stream');
+      return;
+    }
+    if (!streamKey.trim()) {
+      toast.error('Please enter your YouTube stream key');
+      return;
+    }
+    setKeyLoading(true);
+    const { data, error } = await youtubeAPI.startWithKey(keyVideo, streamKey.trim());
+    setKeyLoading(false);
+    if (data) {
+      setIsLive(true);
+      toast.success(data.message || 'You are now live on YouTube!');
+      loadStreamStatus();
+    } else {
+      toast.error(error || 'Failed to start stream');
+    }
+  };
+
+  const handleStopKeyStream = async () => {
+    setKeyLoading(true);
+    const { data, error } = await youtubeAPI.stopStream();
+    setKeyLoading(false);
+    if (data) {
+      setIsLive(false);
+      toast.success('Stream stopped');
+      loadStreamStatus();
+    } else {
+      toast.error(error || 'Failed to stop stream');
+    }
+  };
 
   useEffect(() => {
     if (hasActivePlan) {
@@ -60,7 +103,10 @@ const LiveSlot = () => {
     const { data } = await videoAPI.getAll();
     if (data) {
       setVideos(data);
-      if (data.length > 0) setSelectedVideo(data[0].video_id);
+      if (data.length > 0) {
+        setSelectedVideo(data[0].video_id);
+        setKeyVideo(data[0].video_id);
+      }
     }
   };
 
@@ -245,6 +291,87 @@ const LiveSlot = () => {
             </>
           )}
         </Button>
+      </div>
+
+      {/* Go Live with Stream Key (Key Activation) */}
+      <div className="bg-gray-800/50 backdrop-blur-lg rounded-2xl p-6 border border-gray-700" data-testid="stream-key-card">
+        <h2 className="text-xl font-bold text-white mb-2 flex items-center">
+          <Youtube className="w-5 h-5 mr-2 text-red-500" />
+          Go Live with Your Stream Key
+        </h2>
+        <p className="text-gray-400 text-sm mb-6">
+          Paste the stream key from YouTube Studio (Create → Go Live → Stream key), pick a video, and start streaming instantly.
+        </p>
+
+        {!hasActivePlan ? (
+          <div className="p-4 bg-amber-500/10 border border-amber-500/30 rounded-xl flex items-center justify-between">
+            <p className="text-amber-300 text-sm flex items-center">
+              <AlertTriangle className="w-4 h-4 mr-2" />
+              Activate a plan/slot to unlock streaming.
+            </p>
+            <Button
+              onClick={() => navigate('/dashboard/billings')}
+              size="sm"
+              className="bg-gradient-to-r from-emerald-500 to-emerald-600 hover:from-emerald-600 hover:to-emerald-700 text-white"
+            >
+              View Plans
+            </Button>
+          </div>
+        ) : (
+          <div className="space-y-4">
+            <div>
+              <Label className="text-gray-300">Select Video</Label>
+              <select
+                value={keyVideo}
+                onChange={(e) => setKeyVideo(e.target.value)}
+                disabled={isLive}
+                className="mt-1 w-full bg-gray-700 border border-gray-600 text-white rounded-lg px-3 py-2 disabled:opacity-60"
+                data-testid="key-video-select"
+              >
+                {videos.length === 0 && <option value="">No videos — upload one first</option>}
+                {videos.map((v) => (
+                  <option key={v.video_id} value={v.video_id}>{v.title}</option>
+                ))}
+              </select>
+            </div>
+
+            <div>
+              <Label htmlFor="stream-key" className="text-gray-300">YouTube Stream Key</Label>
+              <Input
+                id="stream-key"
+                type="password"
+                placeholder="xxxx-xxxx-xxxx-xxxx-xxxx"
+                value={streamKey}
+                onChange={(e) => setStreamKey(e.target.value)}
+                disabled={isLive}
+                data-testid="stream-key-input"
+                className="mt-1 bg-gray-700 border-gray-600 text-white placeholder:text-gray-500 disabled:opacity-60"
+              />
+            </div>
+
+            {!isLive ? (
+              <Button
+                onClick={handleStartWithKey}
+                disabled={keyLoading || videos.length === 0}
+                data-testid="start-with-key-button"
+                className="w-full py-6 text-lg font-semibold bg-red-600 hover:bg-red-700 text-white"
+              >
+                <PlayCircle className="w-5 h-5 mr-2" />
+                {keyLoading ? 'Starting...' : 'Start Live Stream'}
+              </Button>
+            ) : (
+              <Button
+                onClick={handleStopKeyStream}
+                disabled={keyLoading}
+                data-testid="stop-key-stream-button"
+                className="w-full py-6 text-lg font-semibold bg-gray-600 hover:bg-gray-700 text-white"
+              >
+                <StopCircle className="w-5 h-5 mr-2" />
+                {keyLoading ? 'Stopping...' : 'Stop Live Stream'}
+              </Button>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Stream Settings */}

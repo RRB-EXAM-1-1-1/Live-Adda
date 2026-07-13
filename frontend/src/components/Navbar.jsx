@@ -20,36 +20,39 @@ export const Navbar = () => {
             <span className="text-xl font-bold text-gray-900">Live Adda</span>
           </Link>
 
-          <div className="flex items-center space-x-6">
-            <Link to="/#features" className="text-gray-600 hover:text-gray-900 transition-colors font-medium">
+          <div className="flex items-center space-x-3 sm:space-x-6">
+            <Link to="/#features" className="hidden md:inline text-gray-600 hover:text-gray-900 transition-colors font-medium">
               Features
             </Link>
-            <Link to="/#pricing" className="text-gray-600 hover:text-gray-900 transition-colors font-medium">
+            <Link to="/#pricing" className="hidden md:inline text-gray-600 hover:text-gray-900 transition-colors font-medium">
               Pricing
             </Link>
             
             {isLoggedIn ? (
               <div className="flex items-center space-x-3">
-                <span className="text-sm text-gray-600">Hello, {user?.name?.split(' ')[0]}</span>
+                <span className="hidden sm:inline text-sm text-gray-600">Hello, {user?.name?.split(' ')[0]}</span>
                 <Button 
                   onClick={() => navigate('/dashboard')}
+                  data-testid="navbar-dashboard-btn"
                   className="bg-gradient-to-r from-emerald-500 to-emerald-600 hover:from-emerald-600 hover:to-emerald-700 text-white shadow-md hover:shadow-lg transition-all"
                 >
                   Dashboard
                 </Button>
               </div>
             ) : (
-              <div className="flex items-center space-x-3">
+              <div className="flex items-center space-x-2 sm:space-x-3">
                 <Button 
                   variant="ghost" 
                   onClick={() => navigate('/login')}
-                  className="text-gray-600 hover:text-gray-900"
+                  data-testid="navbar-login-btn"
+                  className="text-gray-600 hover:text-gray-900 px-3 sm:px-4"
                 >
                   Login
                 </Button>
                 <Button 
                   onClick={() => navigate('/register')}
-                  className="bg-gradient-to-r from-emerald-500 to-emerald-600 hover:from-emerald-600 hover:to-emerald-700 text-white shadow-md hover:shadow-lg transition-all"
+                  data-testid="navbar-get-started-btn"
+                  className="bg-gradient-to-r from-emerald-500 to-emerald-600 hover:from-emerald-600 hover:to-emerald-700 text-white shadow-md hover:shadow-lg transition-all px-3 sm:px-4"
                 >
                   Get Started
                 </Button>

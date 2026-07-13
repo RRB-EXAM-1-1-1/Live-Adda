@@ -355,19 +355,26 @@ class TestIdempotentActivation:
         assert result is False
 
 
-# ==================== YouTube endpoints (not configured paths) ====================
+# ==================== YouTube endpoints ====================
 
 class TestYouTubeNotConfigured:
-    def test_status_returns_not_configured(self, admin_session):
+    def test_status_returns_configured_but_not_connected(self, admin_session):
         r = admin_session.get(f"{API}/youtube/status", timeout=30)
         assert r.status_code == 200
         data = r.json()
-        assert data == {"configured": False, "connected": False}
+        # Env now has YOUTUBE_CLIENT_ID/SECRET set; user hasn't OAuth-linked.
+        assert data.get("configured") is True
+        assert data.get("connected") is False
 
-    def test_authorize_returns_503(self, admin_session):
-        r = admin_session.get(f"{API}/youtube/oauth/authorize", timeout=30)
-        assert r.status_code == 503
-        assert "not configured" in r.json().get("detail", "").lower()
+    def test_authorize_returns_authorization_url(self, admin_session):
+        r = admin_session.get(f"{API}/youtube/oauth/authorize", timeout=30, allow_redirects=False)
+        # Now that env is configured, endpoint should return 200 with an auth URL
+        # (or 302 redirect to Google). Accept either.
+        assert r.status_code in (200, 302), r.text
+        if r.status_code == 200:
+            body = r.json()
+            url = body.get("authorization_url") or body.get("auth_url") or ""
+            assert "accounts.google.com" in url or "oauth" in url.lower()
 
     def test_broadcast_create_without_plan_returns_403(self, fresh_user):
         s, _, _ = fresh_user
@@ -384,6 +391,111 @@ class TestYouTubeNotConfigured:
     def test_youtube_disconnect_no_op_ok(self, admin_session):
         r = admin_session.delete(f"{API}/youtube/disconnect", timeout=30)
         assert r.status_code == 200
+
+
+# ==================== Key Activation (start-with-key / stop) ====================
+
+def _get_mongo_db_static():
+    from pymongo import MongoClient
+    from pathlib import Path
+    env = Path("/app/backend/.env").read_text().splitlines()
+    cfg = {}
+    for line in env:
+        if "=" in line and not line.startswith("#"):
+            k, v = line.split("=", 1)
+            cfg[k.strip()] = v.strip().strip('"')
+    cli = MongoClient(cfg["MONGO_URL"])
+    return cli[cfg["DB_NAME"]]
+
+
+@pytest.fixture(scope="class")
+def key_user():
+    """Dedicated fresh user with a daily plan seeded via Mongo (isolates from
+    admin-shared state used by other parallel test classes)."""
+    from datetime import datetime, timezone, timedelta
+    s = requests.Session()
+    email = f"TEST_keyuser_{uuid.uuid4().hex[:8]}@example.com"
+    r = s.post(f"{API}/auth/register", json={
+        "email": email, "password": "keypw123", "name": "Key Tester"
+    }, timeout=30)
+    assert r.status_code == 200, r.text
+    uid = r.json()["user_id"]
+    db = _get_mongo_db_static()
+    db.users.update_one({"user_id": uid}, {"$set": {
+        "plan": "daily",
+        "plan_expires_at": datetime.now(timezone.utc) + timedelta(days=1),
+    }})
+    yield s, email, uid
+    # cleanup
+    db.users.delete_one({"user_id": uid})
+    db.videos.delete_many({"user_id": uid})
+    db.live_streams.delete_many({"user_id": uid})
+
+
+class TestKeyActivation:
+    """Iteration 3: /api/stream/start-with-key + /api/stream/stop.
+    NOTE: With a fake key ffmpeg exits almost immediately; that is EXPECTED.
+    We validate the endpoint contract (status codes, messages, DB record), not
+    the actual RTMP push. Uses a dedicated key_user to avoid parallel-race with
+    admin storage/live-slot tests."""
+
+    def test_start_with_key_without_plan_returns_gatekeep(self, fresh_user):
+        s, _, _ = fresh_user
+        r = s.post(f"{API}/stream/start-with-key",
+                   json={"video_id": "any", "stream_key": "any-key"}, timeout=30)
+        assert r.status_code == 403, r.text
+        assert r.json().get("detail") == GATEKEEP_MSG
+
+    def test_start_with_key_empty_stream_key_returns_400(self, key_user):
+        s, _, _ = key_user
+        r = s.post(f"{API}/stream/start-with-key",
+                   json={"video_id": "any", "stream_key": "   "}, timeout=30)
+        assert r.status_code == 400, r.text
+        assert r.json().get("detail") == "Stream key is required"
+
+    def test_start_with_key_missing_video_returns_404(self, key_user):
+        s, _, _ = key_user
+        r = s.post(f"{API}/stream/start-with-key",
+                   json={"video_id": "does_not_exist_xyz", "stream_key": "abcd-efgh-ijkl-mnop"}, timeout=30)
+        assert r.status_code == 404, r.text
+        assert r.json().get("detail") == "Video not found"
+
+    def test_stop_stream_no_active_returns_404(self, key_user):
+        s, _, _ = key_user
+        # Ensure clean state
+        s.post(f"{API}/stream/stop", timeout=30)
+        r = s.post(f"{API}/stream/stop", timeout=30)
+        assert r.status_code == 404, r.text
+        assert r.json().get("detail") == "No active stream"
+
+    def test_start_with_key_success_and_stop(self, key_user):
+        s, _, _ = key_user
+        # Upload a small video first
+        files = {"file": ("keyclip.mp4", io.BytesIO(b"x" * 2048), "video/mp4")}
+        data = {"title": "TEST_key_stream_video"}
+        up = s.post(f"{API}/videos/upload", files=files, data=data, timeout=60)
+        assert up.status_code == 200, up.text
+        vid = up.json()["video_id"]
+
+        try:
+            r = s.post(
+                f"{API}/stream/start-with-key",
+                json={"video_id": vid, "stream_key": "fake-yt-key-abcd-efgh"},
+                timeout=30,
+            )
+            assert r.status_code == 200, r.text
+            body = r.json()
+            assert body.get("message") == "You are now live on YouTube!"
+            assert body.get("current_video") == "TEST_key_stream_video"
+
+            # Give ffmpeg a moment; then stop the stream (endpoint should succeed
+            # regardless of whether ffmpeg has already exited due to fake key)
+            time.sleep(1)
+            r2 = s.post(f"{API}/stream/stop", timeout=30)
+            assert r2.status_code == 200, r2.text
+            assert r2.json().get("message") == "Stream stopped"
+        finally:
+            s.delete(f"{API}/videos/{vid}", timeout=30)
 
 
 # ==================== Payments tests ====================
