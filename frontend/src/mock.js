@@ -4,7 +4,7 @@ export const mockPlans = [
   {
     id: 'daily',
     name: 'Daily',
-    price: 4.99,
+    price: '₹35',
     duration: '24 Hours',
     badge: null,
     features: [
@@ -17,7 +17,7 @@ export const mockPlans = [
   {
     id: 'weekly',
     name: 'Weekly',
-    price: 24.99,
+    price: '₹199',
     duration: '7 Days',
     badge: 'Popular',
     features: [
@@ -30,7 +30,7 @@ export const mockPlans = [
   {
     id: 'monthly',
     name: 'Monthly',
-    price: 79.99,
+    price: '₹599',
     duration: '30 Days',
     badge: 'Best Value',
     features: [

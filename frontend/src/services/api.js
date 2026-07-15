@@ -210,6 +210,27 @@ export const supportAPI = {
   }
 };
 
+// Razorpay APIs
+export const razorpayAPI = {
+  createOrder: async (planId) => {
+    try {
+      const { data } = await api.post('/razorpay/create-order', { plan_id: planId });
+      return { data, error: null };
+    } catch (error) {
+      return { data: null, error: formatApiError(error) };
+    }
+  },
+
+  verifyPayment: async (payload) => {
+    try {
+      const { data } = await api.post('/razorpay/verify-payment', payload);
+      return { data, error: null };
+    } catch (error) {
+      return { data: null, error: formatApiError(error) };
+    }
+  }
+};
+
 // Dashboard APIs
 export const dashboardAPI = {
   getStats: async () => {

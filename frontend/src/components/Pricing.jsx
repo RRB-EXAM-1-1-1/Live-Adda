@@ -65,7 +65,7 @@ export const Pricing = () => {
 
                   {/* Price */}
                   <div className="mb-8">
-                    <span className="text-5xl font-bold text-gray-900">${plan.price}</span>
+                    <span className="text-5xl font-bold text-gray-900">{plan.price}</span>
                   </div>
 
                   {/* Features */}

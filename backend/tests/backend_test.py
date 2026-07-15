@@ -460,15 +460,21 @@ class TestKeyActivation:
         assert r.status_code == 404, r.text
         assert r.json().get("detail") == "Video not found"
 
-    def test_stop_stream_no_active_returns_404(self, key_user):
+    def test_stop_stream_no_active_is_idempotent(self, key_user):
+        """Main agent implemented iteration-3 recommendation: stop is now idempotent
+        (returns 200 with 'Already stopped' instead of 404)."""
         s, _, _ = key_user
         # Ensure clean state
         s.post(f"{API}/stream/stop", timeout=30)
         r = s.post(f"{API}/stream/stop", timeout=30)
-        assert r.status_code == 404, r.text
-        assert r.json().get("detail") == "No active stream"
+        assert r.status_code == 200, r.text
+        assert r.json().get("message") in ("Already stopped", "Stream stopped")
 
     def test_start_with_key_success_and_stop(self, key_user):
+        # Requires ffmpeg on PATH; skip if not present (environment gap)
+        import shutil
+        if not shutil.which("ffmpeg"):
+            pytest.skip("ffmpeg binary not installed in this environment")
         s, _, _ = key_user
         # Upload a small video first
         files = {"file": ("keyclip.mp4", io.BytesIO(b"x" * 2048), "video/mp4")}
@@ -536,6 +542,8 @@ class TestBillings:
         data = r.json()
         assert data["status"] == "active"
         assert data["plan_name"] == "Monthly"
+        # INR pricing (iteration 4) - admin has monthly plan
+        assert data["price"] == 599
 
     def test_current_plan_no_plan(self, fresh_user):
         s, _, _ = fresh_user
@@ -618,3 +626,218 @@ class TestDashboard:
         data = r.json()
         assert data.get("plan") is None
         assert data.get("total_videos") == 0
+
+
+# ==================== Razorpay Payment tests (iteration 4) ====================
+
+import hmac as _hmac
+import hashlib as _hashlib
+
+
+def _load_env_secret():
+    from pathlib import Path
+    env = Path("/app/backend/.env").read_text().splitlines()
+    cfg = {}
+    for line in env:
+        if "=" in line and not line.startswith("#"):
+            k, v = line.split("=", 1)
+            cfg[k.strip()] = v.strip().strip('"')
+    return cfg
+
+
+@pytest.fixture(scope="class")
+def rz_fresh_user():
+    """Fresh no-plan user for Razorpay activation tests (isolated from other classes)."""
+    from datetime import datetime, timezone
+    s = requests.Session()
+    email = f"TEST_rzuser_{uuid.uuid4().hex[:8]}@example.com"
+    r = s.post(f"{API}/auth/register", json={
+        "email": email, "password": "rzpw12345", "name": "Razorpay Tester"
+    }, timeout=30)
+    assert r.status_code == 200, r.text
+    uid = r.json()["user_id"]
+    yield s, email, uid
+    # cleanup
+    db = _get_mongo_db_static()
+    db.users.delete_one({"user_id": uid})
+    db.payment_transactions.delete_many({"user_id": uid})
+
+
+class TestRazorpayCreateOrder:
+    """POST /api/razorpay/create-order"""
+
+    def test_create_order_without_auth_returns_401(self):
+        r = requests.post(f"{API}/razorpay/create-order", json={"plan_id": "daily"}, timeout=30)
+        assert r.status_code == 401, r.text
+
+    def test_create_order_invalid_plan_returns_400(self, admin_session):
+        r = admin_session.post(f"{API}/razorpay/create-order", json={"plan_id": "yearly"}, timeout=30)
+        assert r.status_code == 400, r.text
+        assert r.json().get("detail") == "Invalid plan"
+
+    @pytest.mark.parametrize("plan_id,expected_paise", [
+        ("daily", 3500),
+        ("weekly", 19900),
+        ("monthly", 59900),
+    ])
+    def test_create_order_valid_plan_returns_order(self, admin_session, plan_id, expected_paise):
+        r = admin_session.post(f"{API}/razorpay/create-order",
+                               json={"plan_id": plan_id}, timeout=30)
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert data["order_id"].startswith("order_"), f"unexpected order id: {data.get('order_id')}"
+        assert data["amount"] == expected_paise, f"expected {expected_paise} paise, got {data['amount']}"
+        assert data["currency"] == "INR"
+        assert data["key_id"].startswith("rzp_"), data.get("key_id")
+        assert data["plan_name"] in ("Daily", "Weekly", "Monthly")
+        assert "prefill" in data
+        assert data["prefill"].get("email") == ADMIN_EMAIL
+
+        # Verify pending transaction was persisted with gateway='razorpay'
+        db = _get_mongo_db_static()
+        txn = db.payment_transactions.find_one({"order_id": data["order_id"]})
+        assert txn is not None, "pending payment_transactions record not created"
+        assert txn["gateway"] == "razorpay"
+        assert txn["plan_id"] == plan_id
+        assert txn["payment_status"] == "pending"
+        assert txn["currency"] == "INR"
+        assert txn["amount"] == {"daily": 35, "weekly": 199, "monthly": 599}[plan_id]
+        # cleanup this synthetic order
+        db.payment_transactions.delete_one({"order_id": data["order_id"]})
+
+
+class TestRazorpayVerifyPayment:
+    """POST /api/razorpay/verify-payment - signature verification + idempotent activation"""
+
+    def test_verify_missing_fields_returns_400(self, admin_session):
+        r = admin_session.post(f"{API}/razorpay/verify-payment",
+                               json={"razorpay_order_id": "order_x"}, timeout=30)
+        assert r.status_code == 400, r.text
+        assert "Missing" in r.json().get("detail", "")
+
+    def test_verify_incorrect_signature_returns_400_and_marks_failed(self, rz_fresh_user):
+        s, _, uid = rz_fresh_user
+        # First create a real order so the transaction exists
+        r = s.post(f"{API}/razorpay/create-order", json={"plan_id": "daily"}, timeout=30)
+        assert r.status_code == 200, r.text
+        order_id = r.json()["order_id"]
+
+        # Send an incorrect signature (well-formed hex, wrong value)
+        r2 = s.post(f"{API}/razorpay/verify-payment", json={
+            "razorpay_order_id": order_id,
+            "razorpay_payment_id": "pay_fake_incorrect_sig",
+            "razorpay_signature": "0" * 64,
+        }, timeout=30)
+        assert r2.status_code == 400, r2.text
+        assert r2.json().get("detail") == "Payment verification failed"
+
+        # Transaction must be marked failed
+        db = _get_mongo_db_static()
+        txn = db.payment_transactions.find_one({"order_id": order_id})
+        assert txn is not None
+        assert txn["payment_status"] == "failed"
+        assert txn["status"] == "signature_mismatch"
+
+        # Cleanup
+        db.payment_transactions.delete_one({"order_id": order_id})
+
+    def test_verify_unknown_order_with_valid_sig_returns_404(self, admin_session):
+        cfg = _load_env_secret()
+        secret = cfg["RAZORPAY_KEY_SECRET"]
+        fake_order = f"order_UNKNOWN_{uuid.uuid4().hex[:10]}"
+        fake_pay = "pay_fake_unknown"
+        sig = _hmac.new(secret.encode(), f"{fake_order}|{fake_pay}".encode(), _hashlib.sha256).hexdigest()
+        r = admin_session.post(f"{API}/razorpay/verify-payment", json={
+            "razorpay_order_id": fake_order,
+            "razorpay_payment_id": fake_pay,
+            "razorpay_signature": sig,
+        }, timeout=30)
+        assert r.status_code == 404, r.text
+        assert r.json().get("detail") == "Order not found"
+
+    def test_verify_correct_signature_activates_plan_idempotently(self, rz_fresh_user):
+        """End-to-end: create-order -> compute HMAC signature -> verify-payment.
+        Confirms plan+plan_expires_at get set AND second verify is a no-op."""
+        from datetime import datetime, timezone
+        s, email, uid = rz_fresh_user
+
+        # 1) Confirm user starts with no plan
+        me0 = s.get(f"{API}/auth/me", timeout=30).json()
+        # Reset in case a previous parametrized test left something
+        db = _get_mongo_db_static()
+        db.users.update_one({"user_id": uid}, {"$set": {"plan": None, "plan_expires_at": None}})
+        db.payment_transactions.delete_many({"user_id": uid})
+
+        # 2) Create real order
+        r = s.post(f"{API}/razorpay/create-order", json={"plan_id": "weekly"}, timeout=30)
+        assert r.status_code == 200, r.text
+        order_id = r.json()["order_id"]
+
+        # 3) Compute signature = HMAC(order_id|payment_id, secret)
+        cfg = _load_env_secret()
+        secret = cfg["RAZORPAY_KEY_SECRET"]
+        fake_pay = f"pay_test_{uuid.uuid4().hex[:12]}"
+        sig = _hmac.new(secret.encode(), f"{order_id}|{fake_pay}".encode(), _hashlib.sha256).hexdigest()
+
+        # 4) Verify-payment first call -> activates plan
+        r2 = s.post(f"{API}/razorpay/verify-payment", json={
+            "razorpay_order_id": order_id,
+            "razorpay_payment_id": fake_pay,
+            "razorpay_signature": sig,
+        }, timeout=30)
+        assert r2.status_code == 200, r2.text
+        assert r2.json().get("status") == "success"
+
+        # 5) Confirm plan activation via /api/auth/me
+        me = s.get(f"{API}/auth/me", timeout=30).json()
+        assert me["plan"] == "weekly", f"plan not activated, got {me['plan']!r}"
+        assert me["plan_expires_at"] is not None
+        expires_at_1 = me["plan_expires_at"]
+
+        # 6) Confirm via billings/current-plan too (INR pricing)
+        cp = s.get(f"{API}/billings/current-plan", timeout=30).json()
+        assert cp["status"] == "active"
+        assert cp["plan_name"] == "Weekly"
+        assert cp["price"] == 199
+
+        # 7) Idempotency: second call must NOT double-apply (expiry unchanged)
+        time.sleep(1)  # ensure any timestamp diff would be visible
+        r3 = s.post(f"{API}/razorpay/verify-payment", json={
+            "razorpay_order_id": order_id,
+            "razorpay_payment_id": fake_pay,
+            "razorpay_signature": sig,
+        }, timeout=30)
+        assert r3.status_code == 200, r3.text
+        me2 = s.get(f"{API}/auth/me", timeout=30).json()
+        assert me2["plan"] == "weekly"
+        assert me2["plan_expires_at"] == expires_at_1, (
+            f"expiry shifted on idempotent replay: {expires_at_1} -> {me2['plan_expires_at']}"
+        )
+
+        # 8) Regression: this user (now activated) should be able to hit gated endpoint
+        r4 = s.get(f"{API}/live-slot", timeout=30)
+        assert r4.status_code == 200, "activated user should pass gatekeeping"
+
+    def test_no_plan_user_still_gated_after_failed_verify(self, rz_fresh_user):
+        """Regression: gatekeeping still enforced for a user who paid nothing."""
+        # Use a NEW isolated session so we don't reuse the activated one above.
+        s2 = requests.Session()
+        email = f"TEST_rzgate_{uuid.uuid4().hex[:8]}@example.com"
+        r = s2.post(f"{API}/auth/register", json={
+            "email": email, "password": "pw12345", "name": "RZ Gate"
+        }, timeout=30)
+        assert r.status_code == 200
+
+        # No plan - gatekeeping must apply
+        r2 = s2.get(f"{API}/live-slot", timeout=30)
+        assert r2.status_code == 403
+        assert r2.json().get("detail") == GATEKEEP_MSG
+
+        files = {"file": ("t.mp4", io.BytesIO(b"a"), "video/mp4")}
+        r3 = s2.post(f"{API}/videos/upload", files=files, data={"title": "TEST_x"}, timeout=30)
+        assert r3.status_code == 403
+        assert r3.json().get("detail") == GATEKEEP_MSG
+
+        # cleanup
+        db = _get_mongo_db_static()
+        db.users.delete_one({"email": email})

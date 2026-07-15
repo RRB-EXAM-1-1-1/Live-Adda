@@ -14,6 +14,9 @@ import bcrypt
 import jwt
 import aiofiles
 from emergentintegrations.payments.stripe.checkout import StripeCheckout, CheckoutSessionRequest
+import razorpay
+import hmac
+import hashlib
 import youtube_service
 
 ROOT_DIR = Path(__file__).parent
@@ -29,6 +32,10 @@ JWT_SECRET = os.environ['JWT_SECRET']
 JWT_ALGORITHM = "HS256"
 MAX_STORAGE_BYTES = int(os.environ.get('MAX_STORAGE_GB', '2')) * 1024 * 1024 * 1024  # 2GB
 STRIPE_API_KEY = os.environ['STRIPE_API_KEY']
+RAZORPAY_KEY_ID = os.environ.get('RAZORPAY_KEY_ID', '')
+RAZORPAY_KEY_SECRET = os.environ.get('RAZORPAY_KEY_SECRET', '')
+RAZORPAY_WEBHOOK_SECRET = os.environ.get('RAZORPAY_WEBHOOK_SECRET', '')
+razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET)) if RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET else None
 
 # Create uploads directory
 UPLOAD_DIR = ROOT_DIR / 'uploads' / 'videos'
@@ -38,9 +45,9 @@ THUMBNAIL_DIR.mkdir(parents=True, exist_ok=True)
 
 # Plan configurations
 PLANS = {
-    "daily": {"price": 4.99, "duration_days": 1, "name": "Daily"},
-    "weekly": {"price": 24.99, "duration_days": 7, "name": "Weekly"},
-    "monthly": {"price": 79.99, "duration_days": 30, "name": "Monthly"}
+    "daily": {"price": 4.99, "inr": 35, "duration_days": 1, "name": "Daily"},
+    "weekly": {"price": 24.99, "inr": 199, "duration_days": 7, "name": "Weekly"},
+    "monthly": {"price": 79.99, "inr": 599, "duration_days": 30, "name": "Monthly"}
 }
 
 # Create the main app without a prefix
@@ -698,6 +705,156 @@ async def stripe_webhook(request: Request):
 
     return {"received": True}
 
+# ==================== RAZORPAY PAYMENT ENDPOINTS ====================
+
+@api_router.post("/razorpay/create-order")
+async def razorpay_create_order(request: Request, user: dict = Depends(get_current_user)):
+    """Create a Razorpay order for the selected plan (amount in paise, INR)."""
+    if not razorpay_client:
+        raise HTTPException(status_code=503, detail="Razorpay is not configured.")
+
+    body = await request.json()
+    plan_id = body.get("plan_id")
+    if plan_id not in PLANS:
+        raise HTTPException(status_code=400, detail="Invalid plan")
+
+    plan = PLANS[plan_id]
+    amount_paise = int(plan["inr"]) * 100  # rupees -> paise
+
+    try:
+        order = razorpay_client.order.create({
+            "amount": amount_paise,
+            "currency": "INR",
+            "payment_capture": 1,
+            "receipt": f"rcpt_{uuid.uuid4().hex[:16]}",  # must be <= 40 chars
+            "notes": {"user_id": user["user_id"], "plan_id": plan_id}
+        })
+    except Exception as e:
+        logger.error(f"Razorpay order creation failed: {e}")
+        raise HTTPException(status_code=502, detail="Failed to create Razorpay order")
+
+    # Record the pending transaction
+    await db.payment_transactions.insert_one({
+        "transaction_id": f"txn_{uuid.uuid4().hex[:12]}",
+        "user_id": user["user_id"],
+        "gateway": "razorpay",
+        "order_id": order["id"],
+        "plan_id": plan_id,
+        "amount": plan["inr"],
+        "currency": "INR",
+        "payment_status": "pending",
+        "status": "created",
+        "created_at": datetime.now(timezone.utc)
+    })
+
+    return {
+        "order_id": order["id"],
+        "amount": amount_paise,
+        "currency": "INR",
+        "key_id": RAZORPAY_KEY_ID,
+        "plan_name": plan["name"],
+        "prefill": {"name": user.get("name", ""), "email": user.get("email", "")}
+    }
+
+@api_router.post("/razorpay/verify-payment")
+async def razorpay_verify_payment(request: Request, user: dict = Depends(get_current_user)):
+    """Verify the Razorpay payment signature and activate the plan on success."""
+    if not razorpay_client:
+        raise HTTPException(status_code=503, detail="Razorpay is not configured.")
+
+    body = await request.json()
+    order_id = body.get("razorpay_order_id")
+    payment_id = body.get("razorpay_payment_id")
+    signature = body.get("razorpay_signature")
+
+    if not (order_id and payment_id and signature):
+        raise HTTPException(status_code=400, detail="Missing payment verification fields")
+
+    # Verify signature: HMAC_SHA256(order_id|payment_id, key_secret)
+    expected = hmac.new(
+        RAZORPAY_KEY_SECRET.encode(),
+        f"{order_id}|{payment_id}".encode(),
+        hashlib.sha256
+    ).hexdigest()
+
+    if not hmac.compare_digest(expected, signature):
+        await db.payment_transactions.update_one(
+            {"order_id": order_id, "user_id": user["user_id"]},
+            {"$set": {"payment_status": "failed", "status": "signature_mismatch"}}
+        )
+        raise HTTPException(status_code=400, detail="Payment verification failed")
+
+    # Look up the transaction to get the plan
+    transaction = await db.payment_transactions.find_one(
+        {"order_id": order_id, "user_id": user["user_id"]}, {"_id": 0}
+    )
+    if not transaction:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    # Idempotent activation
+    result = await db.payment_transactions.update_one(
+        {"order_id": order_id, "status": {"$ne": "completed"}},
+        {"$set": {
+            "payment_status": "paid",
+            "status": "completed",
+            "payment_id": payment_id,
+            "completed_at": datetime.now(timezone.utc)
+        }}
+    )
+
+    if result.modified_count > 0:
+        plan_id = transaction["plan_id"]
+        plan = PLANS[plan_id]
+        expires_at = datetime.now(timezone.utc) + timedelta(days=plan["duration_days"])
+        await db.users.update_one(
+            {"user_id": user["user_id"]},
+            {"$set": {"plan": plan_id, "plan_expires_at": expires_at}}
+        )
+        logger.info(f"Razorpay plan '{plan_id}' activated for user {user['user_id']}")
+
+    return {"status": "success", "message": "Payment verified and plan activated"}
+
+@api_router.post("/razorpay/webhook")
+async def razorpay_webhook(request: Request):
+    """Handle Razorpay webhooks (backup to client-side verification)."""
+    payload = await request.body()
+    signature = request.headers.get("X-Razorpay-Signature", "")
+
+    if not RAZORPAY_WEBHOOK_SECRET:
+        # Webhook secret not configured; acknowledge without processing
+        return {"status": "ignored"}
+
+    try:
+        razorpay_client.utility.verify_webhook_signature(
+            payload.decode(), signature, RAZORPAY_WEBHOOK_SECRET
+        )
+    except Exception as e:
+        logger.error(f"Razorpay webhook verification failed: {e}")
+        raise HTTPException(status_code=400, detail="Invalid webhook signature")
+
+    import json as _json
+    event = _json.loads(payload.decode())
+    if event.get("event") in ("payment.captured", "order.paid"):
+        entity = event.get("payload", {}).get("payment", {}).get("entity", {})
+        order_id = entity.get("order_id")
+        payment_id = entity.get("id")
+        if order_id:
+            txn = await db.payment_transactions.find_one({"order_id": order_id}, {"_id": 0})
+            if txn:
+                res = await db.payment_transactions.update_one(
+                    {"order_id": order_id, "status": {"$ne": "completed"}},
+                    {"$set": {"payment_status": "paid", "status": "completed",
+                              "payment_id": payment_id, "completed_at": datetime.now(timezone.utc)}}
+                )
+                if res.modified_count > 0:
+                    plan = PLANS[txn["plan_id"]]
+                    expires_at = datetime.now(timezone.utc) + timedelta(days=plan["duration_days"])
+                    await db.users.update_one(
+                        {"user_id": txn["user_id"]},
+                        {"$set": {"plan": txn["plan_id"], "plan_expires_at": expires_at}}
+                    )
+    return {"status": "processed"}
+
 # ==================== BILLING ENDPOINTS ====================
 
 @api_router.get("/billings/current-plan")
@@ -715,7 +872,7 @@ async def get_current_plan(user: dict = Depends(get_current_user)):
     
     return {
         "plan_name": plan["name"],
-        "price": plan["price"],
+        "price": plan["inr"],
         "next_billing_date": user.get("plan_expires_at").isoformat() if user.get("plan_expires_at") else None,
         "status": "active"
     }

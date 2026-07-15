@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { CreditCard, Clock, CheckCircle, Loader2 } from 'lucide-react';
 import { Button } from '../components/ui/button';
-import { paymentAPI, billingAPI } from '../services/api';
+import { razorpayAPI, billingAPI } from '../services/api';
 import { useAuth } from '../contexts/AuthContext';
 import { toast } from 'sonner';
 
@@ -10,7 +10,7 @@ const PLANS = [
   {
     id: 'daily',
     name: 'Daily',
-    price: 4.99,
+    price: 35,
     duration: '24 Hours',
     badge: null,
     features: ['1 Active Live Slot', '24/7 Continuous Stream', '2GB Video Storage', 'Standard Support']
@@ -18,7 +18,7 @@ const PLANS = [
   {
     id: 'weekly',
     name: 'Weekly',
-    price: 24.99,
+    price: 199,
     duration: '7 Days',
     badge: 'Popular',
     features: ['1 Active Live Slot', '24/7 Continuous Stream', '2GB Video Storage', 'Priority Support']
@@ -26,7 +26,7 @@ const PLANS = [
   {
     id: 'monthly',
     name: 'Monthly',
-    price: 79.99,
+    price: 599,
     duration: '30 Days',
     badge: 'Best Value',
     features: ['1 Active Live Slot', '24/7 Continuous Stream', '2GB Video Storage', 'Priority Support', 'Advanced Analytics']
@@ -46,12 +46,6 @@ const Billings = () => {
 
   useEffect(() => {
     loadBillingData();
-    
-    // Check for payment redirect
-    const sessionId = searchParams.get('session_id');
-    if (sessionId) {
-      pollPaymentStatus(sessionId);
-    }
   }, []);
 
   const loadBillingData = async () => {
@@ -62,48 +56,60 @@ const Billings = () => {
     if (txnResult.data) setTransactions(txnResult.data);
   };
 
-  const pollPaymentStatus = async (sessionId, attempts = 0) => {
-    const maxAttempts = 5;
-    setPollingPayment(true);
+  const handlePurchase = async (planId) => {
+    if (!window.Razorpay) {
+      toast.error('Payment gateway is still loading. Please try again in a moment.');
+      return;
+    }
+    setProcessingPlan(planId);
+    const { data, error } = await razorpayAPI.createOrder(planId);
 
-    if (attempts >= maxAttempts) {
-      setPollingPayment(false);
-      toast.error('Payment status check timed out. Please refresh the page.');
+    if (!data) {
+      setProcessingPlan(null);
+      toast.error(error || 'Failed to create order');
       return;
     }
 
-    const { data, error } = await paymentAPI.getCheckoutStatus(sessionId);
-
-    if (data) {
-      if (data.payment_status === 'paid') {
+    const options = {
+      key: data.key_id,
+      amount: data.amount,
+      currency: data.currency,
+      name: 'Live Adda',
+      description: `${data.plan_name} Plan`,
+      order_id: data.order_id,
+      prefill: data.prefill,
+      theme: { color: '#059669' },
+      handler: async (response) => {
+        setPollingPayment(true);
+        const verify = await razorpayAPI.verifyPayment({
+          razorpay_order_id: response.razorpay_order_id,
+          razorpay_payment_id: response.razorpay_payment_id,
+          razorpay_signature: response.razorpay_signature
+        });
         setPollingPayment(false);
-        toast.success('🎉 Payment successful! Your plan is now active.');
-        setSearchParams({});
-        await refreshUser();
-        await loadBillingData();
-        return;
-      } else if (data.status === 'expired') {
-        setPollingPayment(false);
-        toast.error('Payment session expired. Please try again.');
-        setSearchParams({});
-        return;
+        setProcessingPlan(null);
+        if (verify.data) {
+          toast.success('🎉 Payment successful! Your plan is now active.');
+          await refreshUser();
+          await loadBillingData();
+        } else {
+          toast.error(verify.error || 'Payment verification failed');
+        }
+      },
+      modal: {
+        ondismiss: () => {
+          setProcessingPlan(null);
+          toast.info('Payment cancelled');
+        }
       }
-    }
+    };
 
-    // Continue polling
-    setTimeout(() => pollPaymentStatus(sessionId, attempts + 1), 2000);
-  };
-
-  const handlePurchase = async (planId) => {
-    setProcessingPlan(planId);
-    const { data, error } = await paymentAPI.createCheckout(planId);
-    setProcessingPlan(null);
-
-    if (data && data.checkout_url) {
-      window.location.href = data.checkout_url;
-    } else {
-      toast.error(error || 'Failed to create checkout session');
-    }
+    const rzp = new window.Razorpay(options);
+    rzp.on('payment.failed', (resp) => {
+      setProcessingPlan(null);
+      toast.error(resp.error?.description || 'Payment failed');
+    });
+    rzp.open();
   };
 
   const getRemainingDays = () => {
@@ -140,7 +146,7 @@ const Billings = () => {
             <div>
               <p className="text-blue-100 mb-1">Current Plan</p>
               <h2 className="text-3xl font-bold mb-2">{currentPlan?.plan_name || user?.plan} Plan</h2>
-              <p className="text-blue-100">${currentPlan?.price} </p>
+              <p className="text-blue-100">₹{currentPlan?.price} </p>
             </div>
             <div className="bg-white/20 backdrop-blur-sm px-4 py-2 rounded-full">
               <span className="font-semibold">Active</span>
@@ -196,7 +202,7 @@ const Billings = () => {
                 )}
                 <h3 className="text-xl font-bold text-white mb-2">{plan.name}</h3>
                 <div className="mb-4">
-                  <span className="text-3xl font-bold text-white">${plan.price}</span>
+                  <span className="text-3xl font-bold text-white">₹{plan.price}</span>
                   <span className="text-gray-400"> / {plan.duration}</span>
                 </div>
                 <ul className="space-y-2 mb-6">
@@ -250,7 +256,7 @@ const Billings = () => {
                   <tr key={txn.transaction_id} className="border-b border-gray-700/50">
                     <td className="py-4 text-gray-300">{new Date(txn.created_at).toLocaleDateString()}</td>
                     <td className="py-4 text-white capitalize">{txn.plan_id} Plan</td>
-                    <td className="py-4 text-right text-white font-medium">${txn.amount}</td>
+                    <td className="py-4 text-right text-white font-medium">₹{txn.amount}</td>
                     <td className="py-4 text-right">
                       <span className={`inline-block px-3 py-1 text-xs font-semibold rounded-full ${
                         txn.payment_status === 'paid' 
