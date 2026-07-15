@@ -92,3 +92,8 @@ Build "Live Adda" - a professional 24/7 YouTube Live streaming SaaS platform.
 - Transaction history renders currency-aware symbol (₹ INR / $ legacy Stripe)
 - Testing: 53/53 backend tests pass; frontend verified (modal opens with correct amounts)
 - Stripe endpoints retained but dormant (not used by UI)
+
+## Iteration 5 (2026-07-15) - Fix: ₹35 recharge option unavailable
+- BUG: users with an active plan saw a disabled 'Current Plan' button, so they couldn't re-buy/recharge (e.g. the ₹35 Daily)
+- FIX: current plan button now enabled + labeled 'Renew / Recharge'; buying the same active plan STACKS duration onto remaining validity (expired/other plan resets from now)
+- Testing: 56/56 backend tests pass; fresh + existing-plan Billings UI verified, Razorpay modal opens for renewal

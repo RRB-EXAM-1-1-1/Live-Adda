@@ -645,6 +645,26 @@ def _load_env_secret():
     return cfg
 
 
+def _create_order_with_retry(session, plan_id, retries=6, backoff=8):
+    """Razorpay LIVE keys are rate-limited by the provider (~1 successful
+    order/minute in this preview env), returning 502 'Failed to create
+    Razorpay order' -> Razorpay 'Authentication failed' when throttled.
+    Retry a few times with backoff so tests aren't flaky due to external
+    provider throttling."""
+    last_resp = None
+    for attempt in range(retries):
+        r = session.post(f"{API}/razorpay/create-order",
+                         json={"plan_id": plan_id}, timeout=30)
+        if r.status_code == 200:
+            return r
+        last_resp = r
+        # Only retry the provider-throttle path (502)
+        if r.status_code != 502:
+            return r
+        time.sleep(backoff)
+    return last_resp
+
+
 @pytest.fixture(scope="class")
 def rz_fresh_user():
     """Fresh no-plan user for Razorpay activation tests (isolated from other classes)."""
@@ -681,8 +701,7 @@ class TestRazorpayCreateOrder:
         ("monthly", 59900),
     ])
     def test_create_order_valid_plan_returns_order(self, admin_session, plan_id, expected_paise):
-        r = admin_session.post(f"{API}/razorpay/create-order",
-                               json={"plan_id": plan_id}, timeout=30)
+        r = _create_order_with_retry(admin_session, plan_id)
         assert r.status_code == 200, r.text
         data = r.json()
         assert data["order_id"].startswith("order_"), f"unexpected order id: {data.get('order_id')}"
@@ -718,7 +737,7 @@ class TestRazorpayVerifyPayment:
     def test_verify_incorrect_signature_returns_400_and_marks_failed(self, rz_fresh_user):
         s, _, uid = rz_fresh_user
         # First create a real order so the transaction exists
-        r = s.post(f"{API}/razorpay/create-order", json={"plan_id": "daily"}, timeout=30)
+        r = _create_order_with_retry(s, "daily")
         assert r.status_code == 200, r.text
         order_id = r.json()["order_id"]
 
@@ -769,7 +788,7 @@ class TestRazorpayVerifyPayment:
         db.payment_transactions.delete_many({"user_id": uid})
 
         # 2) Create real order
-        r = s.post(f"{API}/razorpay/create-order", json={"plan_id": "weekly"}, timeout=30)
+        r = _create_order_with_retry(s, "weekly")
         assert r.status_code == 200, r.text
         order_id = r.json()["order_id"]
 
@@ -817,6 +836,185 @@ class TestRazorpayVerifyPayment:
         # 8) Regression: this user (now activated) should be able to hit gated endpoint
         r4 = s.get(f"{API}/live-slot", timeout=30)
         assert r4.status_code == 200, "activated user should pass gatekeeping"
+
+    def test_renewal_extends_expiry_when_active(self):
+        """Iteration 5: A user with an ACTIVE (non-expired) daily plan who
+        re-buys the SAME plan (daily) must have plan_expires_at EXTENDED by
+        ~1 day beyond the previous FUTURE expiry, NOT reset to now+1day.
+        """
+        from datetime import datetime, timezone, timedelta
+        # Fresh isolated user for this test
+        s = requests.Session()
+        email = f"TEST_rzrenew_{uuid.uuid4().hex[:8]}@example.com"
+        r = s.post(f"{API}/auth/register", json={
+            "email": email, "password": "renewpw1", "name": "Renew Tester"
+        }, timeout=30)
+        assert r.status_code == 200, r.text
+        uid = r.json()["user_id"]
+
+        db = _get_mongo_db_static()
+        try:
+            # 1) Seed a FUTURE expiry (12h from now) with an active daily plan
+            future_expiry = datetime.now(timezone.utc) + timedelta(hours=12)
+            db.users.update_one({"user_id": uid}, {"$set": {
+                "plan": "daily",
+                "plan_expires_at": future_expiry,
+            }})
+
+            # Confirm via /auth/me
+            me0 = s.get(f"{API}/auth/me", timeout=30).json()
+            assert me0["plan"] == "daily"
+            prev_expiry = datetime.fromisoformat(me0["plan_expires_at"].replace("Z", "")).replace(tzinfo=timezone.utc)
+            # Should be within a second of what we set
+            assert abs((prev_expiry - future_expiry).total_seconds()) < 5
+
+            # 2) Create real order for daily
+            r2 = _create_order_with_retry(s, "daily")
+            assert r2.status_code == 200, r2.text
+            order_id = r2.json()["order_id"]
+
+            # 3) Compute signature and verify
+            secret = _load_env_secret()["RAZORPAY_KEY_SECRET"]
+            fake_pay = f"pay_test_{uuid.uuid4().hex[:12]}"
+            sig = _hmac.new(secret.encode(), f"{order_id}|{fake_pay}".encode(),
+                            _hashlib.sha256).hexdigest()
+            r3 = s.post(f"{API}/razorpay/verify-payment", json={
+                "razorpay_order_id": order_id,
+                "razorpay_payment_id": fake_pay,
+                "razorpay_signature": sig,
+            }, timeout=30)
+            assert r3.status_code == 200, r3.text
+            assert r3.json().get("status") == "success"
+
+            # 4) Fetch new expiry and assert it is ~= prev_expiry + 1 day
+            me1 = s.get(f"{API}/auth/me", timeout=30).json()
+            assert me1["plan"] == "daily"
+            new_expiry = datetime.fromisoformat(me1["plan_expires_at"].replace("Z", "")).replace(tzinfo=timezone.utc)
+            expected = prev_expiry + timedelta(days=1)
+            delta = abs((new_expiry - expected).total_seconds())
+            assert delta < 5, (
+                f"expected extension {expected.isoformat()} (~prev + 1d), "
+                f"got {new_expiry.isoformat()} (delta={delta}s). "
+                f"Prev={prev_expiry.isoformat()}"
+            )
+            # Sanity: new expiry must be strictly greater than prev_expiry + 23h
+            # (i.e. NOT reset to now+1d which would be ~12h earlier)
+            assert new_expiry > prev_expiry + timedelta(hours=23), (
+                f"expiry looks reset (now+1d) instead of stacked: prev={prev_expiry}, new={new_expiry}"
+            )
+        finally:
+            db.users.delete_one({"user_id": uid})
+            db.payment_transactions.delete_many({"user_id": uid})
+
+    def test_renewal_resets_expiry_when_expired(self):
+        """Iteration 5: If the plan is EXPIRED (plan_expires_at in the past),
+        renewing daily must RESET expiry to now+1day (not stack on the past date).
+        """
+        from datetime import datetime, timezone, timedelta
+        s = requests.Session()
+        email = f"TEST_rzrenexp_{uuid.uuid4().hex[:8]}@example.com"
+        r = s.post(f"{API}/auth/register", json={
+            "email": email, "password": "renewpw2", "name": "Renew Exp Tester"
+        }, timeout=30)
+        assert r.status_code == 200, r.text
+        uid = r.json()["user_id"]
+
+        db = _get_mongo_db_static()
+        try:
+            # 1) Seed a PAST expiry (2 days ago)
+            past_expiry = datetime.now(timezone.utc) - timedelta(days=2)
+            db.users.update_one({"user_id": uid}, {"$set": {
+                "plan": "daily",
+                "plan_expires_at": past_expiry,
+            }})
+
+            # 2) Create real order for daily
+            r2 = _create_order_with_retry(s, "daily")
+            assert r2.status_code == 200, r2.text
+            order_id = r2.json()["order_id"]
+
+            # 3) Verify with correct signature
+            secret = _load_env_secret()["RAZORPAY_KEY_SECRET"]
+            fake_pay = f"pay_test_{uuid.uuid4().hex[:12]}"
+            sig = _hmac.new(secret.encode(), f"{order_id}|{fake_pay}".encode(),
+                            _hashlib.sha256).hexdigest()
+            t_before = datetime.now(timezone.utc)
+            r3 = s.post(f"{API}/razorpay/verify-payment", json={
+                "razorpay_order_id": order_id,
+                "razorpay_payment_id": fake_pay,
+                "razorpay_signature": sig,
+            }, timeout=30)
+            t_after = datetime.now(timezone.utc)
+            assert r3.status_code == 200, r3.text
+
+            # 4) New expiry must be ~ now + 1 day (not stacked on past date)
+            me1 = s.get(f"{API}/auth/me", timeout=30).json()
+            new_expiry = datetime.fromisoformat(me1["plan_expires_at"].replace("Z", "")).replace(tzinfo=timezone.utc)
+            # It should be between t_before+1d and t_after+1d (allow a few seconds slack)
+            low = t_before + timedelta(days=1) - timedelta(seconds=5)
+            high = t_after + timedelta(days=1) + timedelta(seconds=5)
+            assert low <= new_expiry <= high, (
+                f"expected ~now+1d ([{low}, {high}]), got {new_expiry}. "
+                f"past_expiry was {past_expiry}."
+            )
+            # Sanity: must be much greater than past_expiry (>= ~1 day in future)
+            assert new_expiry > datetime.now(timezone.utc) + timedelta(hours=23)
+        finally:
+            db.users.delete_one({"user_id": uid})
+            db.payment_transactions.delete_many({"user_id": uid})
+
+    def test_renewal_different_plan_resets_from_now(self):
+        """Iteration 5 companion: If user holds an ACTIVE plan of a DIFFERENT
+        type (e.g. daily active) and buys weekly, the new expiry must reset
+        from now (not stack) because the plan changed.
+        """
+        from datetime import datetime, timezone, timedelta
+        s = requests.Session()
+        email = f"TEST_rzswitch_{uuid.uuid4().hex[:8]}@example.com"
+        r = s.post(f"{API}/auth/register", json={
+            "email": email, "password": "swpw1", "name": "Switch Tester"
+        }, timeout=30)
+        assert r.status_code == 200, r.text
+        uid = r.json()["user_id"]
+
+        db = _get_mongo_db_static()
+        try:
+            # Active daily plan expiring in ~12h
+            future_expiry = datetime.now(timezone.utc) + timedelta(hours=12)
+            db.users.update_one({"user_id": uid}, {"$set": {
+                "plan": "daily", "plan_expires_at": future_expiry,
+            }})
+
+            # User buys WEEKLY (different plan)
+            r2 = _create_order_with_retry(s, "weekly")
+            assert r2.status_code == 200, r2.text
+            order_id = r2.json()["order_id"]
+
+            secret = _load_env_secret()["RAZORPAY_KEY_SECRET"]
+            fake_pay = f"pay_test_{uuid.uuid4().hex[:12]}"
+            sig = _hmac.new(secret.encode(), f"{order_id}|{fake_pay}".encode(),
+                            _hashlib.sha256).hexdigest()
+            t_before = datetime.now(timezone.utc)
+            r3 = s.post(f"{API}/razorpay/verify-payment", json={
+                "razorpay_order_id": order_id, "razorpay_payment_id": fake_pay,
+                "razorpay_signature": sig,
+            }, timeout=30)
+            t_after = datetime.now(timezone.utc)
+            assert r3.status_code == 200, r3.text
+
+            me1 = s.get(f"{API}/auth/me", timeout=30).json()
+            assert me1["plan"] == "weekly"
+            new_expiry = datetime.fromisoformat(me1["plan_expires_at"].replace("Z", "")).replace(tzinfo=timezone.utc)
+            # Should be ~now + 7d, NOT future_expiry + 7d
+            low = t_before + timedelta(days=7) - timedelta(seconds=5)
+            high = t_after + timedelta(days=7) + timedelta(seconds=5)
+            assert low <= new_expiry <= high, (
+                f"expected ~now+7d ([{low}, {high}]), got {new_expiry}. "
+                f"Previous daily-expiry {future_expiry} should NOT have stacked."
+            )
+        finally:
+            db.users.delete_one({"user_id": uid})
+            db.payment_transactions.delete_many({"user_id": uid})
 
     def test_no_plan_user_still_gated_after_failed_verify(self, rz_fresh_user):
         """Regression: gatekeeping still enforced for a user who paid nothing."""

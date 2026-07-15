@@ -805,12 +805,28 @@ async def razorpay_verify_payment(request: Request, user: dict = Depends(get_cur
     if result.modified_count > 0:
         plan_id = transaction["plan_id"]
         plan = PLANS[plan_id]
-        expires_at = datetime.now(timezone.utc) + timedelta(days=plan["duration_days"])
+        now = datetime.now(timezone.utc)
+
+        # Recharge/renewal: if the user is buying the SAME plan they still hold,
+        # stack the new duration on top of the remaining validity instead of
+        # resetting from now (so they don't lose paid-for time).
+        base = now
+        current_plan = user.get("plan")
+        current_expiry = user.get("plan_expires_at")
+        if current_plan == plan_id and current_expiry:
+            if isinstance(current_expiry, str):
+                current_expiry = datetime.fromisoformat(current_expiry)
+            if current_expiry.tzinfo is None:
+                current_expiry = current_expiry.replace(tzinfo=timezone.utc)
+            if current_expiry > now:
+                base = current_expiry
+
+        expires_at = base + timedelta(days=plan["duration_days"])
         await db.users.update_one(
             {"user_id": user["user_id"]},
             {"$set": {"plan": plan_id, "plan_expires_at": expires_at}}
         )
-        logger.info(f"Razorpay plan '{plan_id}' activated for user {user['user_id']}")
+        logger.info(f"Razorpay plan '{plan_id}' activated/renewed for user {user['user_id']} (expires {expires_at.isoformat()})")
 
     return {"status": "success", "message": "Payment verified and plan activated"}
 

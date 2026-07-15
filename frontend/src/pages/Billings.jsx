@@ -215,14 +215,14 @@ const Billings = () => {
                 </ul>
                 <Button 
                   className="w-full bg-gradient-to-r from-emerald-500 to-emerald-600 hover:from-emerald-600 hover:to-emerald-700 text-white"
-                  disabled={isCurrent || isProcessing}
+                  disabled={isProcessing}
                   onClick={() => handlePurchase(plan.id)}
                   data-testid={`buy-plan-${plan.id}`}
                 >
                   {isProcessing ? (
                     <><Loader2 className="w-4 h-4 mr-2 animate-spin" /> Processing...</>
                   ) : isCurrent ? (
-                    'Current Plan'
+                    'Renew / Recharge'
                   ) : (
                     'Buy Now'
                   )}
