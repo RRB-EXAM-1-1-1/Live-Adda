@@ -83,3 +83,12 @@ Build "Live Adda" - a professional 24/7 YouTube Live streaming SaaS platform.
 ## Next Tasks
 - Implement chunked/streaming upload for large files
 - Wire real YouTube streaming pipeline
+
+## Iteration 4 (2026-07-15) - Razorpay Payment Gateway (INR)
+- Integrated Razorpay as PRIMARY checkout (LIVE keys) replacing Stripe in the UI
+- INR pricing: Daily ₹35, Weekly ₹199, Monthly ₹599 (backend PLANS['inr'], sent as paise)
+- Backend: /api/razorpay/create-order, /api/razorpay/verify-payment (HMAC-SHA256 signature, idempotent plan activation, cross-user protection), /api/razorpay/webhook
+- Frontend: Razorpay Checkout modal in Billings, INR display on landing + billings, checkout.js loaded in index.html
+- Transaction history renders currency-aware symbol (₹ INR / $ legacy Stripe)
+- Testing: 53/53 backend tests pass; frontend verified (modal opens with correct amounts)
+- Stripe endpoints retained but dormant (not used by UI)

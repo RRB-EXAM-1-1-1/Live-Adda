@@ -256,7 +256,7 @@ const Billings = () => {
                   <tr key={txn.transaction_id} className="border-b border-gray-700/50">
                     <td className="py-4 text-gray-300">{new Date(txn.created_at).toLocaleDateString()}</td>
                     <td className="py-4 text-white capitalize">{txn.plan_id} Plan</td>
-                    <td className="py-4 text-right text-white font-medium">₹{txn.amount}</td>
+                    <td className="py-4 text-right text-white font-medium">{txn.currency === 'INR' ? '₹' : '$'}{txn.amount}</td>
                     <td className="py-4 text-right">
                       <span className={`inline-block px-3 py-1 text-xs font-semibold rounded-full ${
                         txn.payment_status === 'paid' 
