@@ -21,7 +21,29 @@ DigitalOcean droplet with 24/7 YouTube streaming.
    - On the OAuth consent screen, add your Google account as a **Test user**
    - ⚠️ `http://` and raw IP addresses are **rejected** by Google — HTTPS + domain only.
 
-3. **Droplet** — Ubuntu 22.04, ≥ 2GB RAM.
+3. **Droplet** — Ubuntu 22.04, ≥ 2GB RAM recommended. 1GB works only with the
+   2GB swap file that `setup.sh` / `update.sh` / `fix-deployment.sh` provision
+   automatically (needed to survive the React production build).
+
+---
+
+## 🚑 Broken deployment? One-shot recovery
+
+If `pip install` failed with `emergentintegrations` / internal `litellm` errors,
+**or** `yarn build` was OOM-killed on a 1GB droplet, run:
+
+```bash
+cd /opt/live-adda
+git pull
+sudo bash deploy/fix-deployment.sh
+```
+
+This script will:
+1. Allocate a 2GB swap file (persistent via `/etc/fstab`) so `yarn build` stops OOM-crashing.
+2. Strip any Emergent-internal lines from `backend/requirements.txt` (defensive).
+3. Reinstall backend deps in the venv (`REBUILD_VENV=1` to wipe & recreate).
+4. Rebuild the frontend with `NODE_OPTIONS=--max-old-space-size=1536` and `GENERATE_SOURCEMAP=false`.
+5. Restart the backend via Supervisor and reload Nginx.
 
 ---
 

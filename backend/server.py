@@ -13,7 +13,15 @@ from datetime import datetime, timezone, timedelta
 import bcrypt
 import jwt
 import aiofiles
-from emergentintegrations.payments.stripe.checkout import StripeCheckout, CheckoutSessionRequest
+# emergentintegrations is optional (Emergent-internal only). Legacy Stripe endpoints
+# degrade gracefully if unavailable. Razorpay is the primary payment path.
+try:
+    from emergentintegrations.payments.stripe.checkout import StripeCheckout, CheckoutSessionRequest
+    STRIPE_AVAILABLE = True
+except ImportError:
+    StripeCheckout = None
+    CheckoutSessionRequest = None
+    STRIPE_AVAILABLE = False
 import razorpay
 import hmac
 import hashlib
@@ -676,6 +684,8 @@ async def create_checkout_session(
     user: dict = Depends(get_current_user)
 ):
     """Create Stripe checkout session"""
+    if not STRIPE_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Stripe checkout is disabled on this deployment. Please use Razorpay.")
     body = await request.json()
     plan_id = body.get("plan_id")
     origin_url = body.get("origin_url")
@@ -772,6 +782,8 @@ async def get_checkout_status(
     user: dict = Depends(get_current_user)
 ):
     """Get payment status and update user plan (polling fallback)"""
+    if not STRIPE_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Stripe checkout is disabled on this deployment.")
     # Get transaction
     transaction = await db.payment_transactions.find_one(
         {"session_id": session_id, "user_id": user["user_id"]},
@@ -801,6 +813,8 @@ async def get_checkout_status(
 async def stripe_webhook(request: Request):
     """Handle Stripe webhooks with signature verification.
     Acts as a reliable backup to frontend polling for plan activation."""
+    if not STRIPE_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Stripe webhook is disabled on this deployment.")
     body = await request.body()
     signature = request.headers.get("Stripe-Signature")
 

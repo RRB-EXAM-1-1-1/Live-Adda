@@ -104,3 +104,14 @@ Build "Live Adda" - a professional 24/7 YouTube Live streaming SaaS platform.
 - BUG dashboard plan: Dashboard now derives plan status from fresh /api/dashboard/stats (+ refreshUser on mount) instead of stale context
 - Toast moved to bottom-right (was overlapping Upload button)
 - Testing: 13 new tests pass (auth refresh + chunked upload + dashboard reflection); all 4 fixes verified end-to-end. NOTE: 8 backend failures are pre-existing Razorpay LIVE-key Cloudflare throttling in preview cluster (not a regression)
+
+
+## Iteration 7 (2026-02) - Self-Hosted Deployment Unblock (DigitalOcean 1GB droplet)
+- BUG: `pip install -r requirements.txt` failed on external VPS due to `emergentintegrations==0.2.0` and internal `litellm` wheel URL (both Emergent-only)
+- BUG: `yarn build` OOM-killed on 1GB RAM droplets during React production build
+- FIX (backend/server.py): `emergentintegrations` import wrapped in try/except with `STRIPE_AVAILABLE` flag; the 3 legacy Stripe endpoints (`/api/payments/checkout-session`, `/api/payments/checkout-status/{id}`, `/api/webhook/stripe`) return 503 gracefully if the module is absent. Razorpay (primary) unaffected.
+- FIX (backend/requirements.txt): removed `emergentintegrations==0.2.0` and internal `litellm @ https://customer-assets.emergentagent.com/...` wheel line. `pip install -r requirements.txt` now works on any vanilla Python 3.11+ environment.
+- FIX (deploy/setup.sh + deploy/update.sh): auto-provisions a 2GB `/swapfile` (persisted in `/etc/fstab`, `vm.swappiness=10`) before frontend build; sets `NODE_OPTIONS=--max-old-space-size=1536`, `GENERATE_SOURCEMAP=false`, `CI=false` so `yarn build` fits in memory on 1GB droplets.
+- NEW: `deploy/fix-deployment.sh` — one-shot recovery script for users whose deploy is already broken (allocates swap, sanitizes requirements defensively, rebuilds venv w/ `REBUILD_VENV=1`, rebuilds frontend with capped Node heap, restarts Supervisor + reloads Nginx).
+- NEW: `deploy/README.md` recovery section documents `sudo bash deploy/fix-deployment.sh` flow.
+- Verification: backend restarts cleanly with `STRIPE_AVAILABLE=True` inside Emergent env (module present) and would be `False` on VPS (module absent) — Razorpay path fully functional in both.

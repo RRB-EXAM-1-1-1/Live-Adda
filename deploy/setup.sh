@@ -51,6 +51,23 @@ apt update && apt upgrade -y
 apt install -y python3 python3-pip python3-venv nodejs npm nginx ffmpeg curl git supervisor gnupg openssl
 npm install -g yarn
 
+# --- Ensure at least 2GB of swap so `yarn build` doesn't get OOM-killed on 1GB droplets ---
+CURRENT_SWAP_MB=$(free -m | awk '/^Swap:/ {print $2}')
+if [ "${CURRENT_SWAP_MB:-0}" -lt 2000 ]; then
+  echo "    Current swap = ${CURRENT_SWAP_MB}MB -> creating /swapfile (2GB)..."
+  swapoff /swapfile 2>/dev/null || true
+  rm -f /swapfile
+  fallocate -l 2G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=2048
+  chmod 600 /swapfile
+  mkswap /swapfile
+  swapon /swapfile
+  grep -q "/swapfile" /etc/fstab || echo "/swapfile none swap sw 0 0" >> /etc/fstab
+  sysctl vm.swappiness=10 || true
+  echo "    Swap enabled: $(free -h | awk '/^Swap:/ {print $2}')"
+else
+  echo "    Swap already >=2GB (${CURRENT_SWAP_MB}MB) — skipping."
+fi
+
 echo "==> [2/9] Installing MongoDB 7.0..."
 if ! command -v mongod >/dev/null 2>&1; then
   curl -fsSL https://pgp.mongodb.com/server-7.0.asc | gpg -o /usr/share/keyrings/mongodb-server-7.0.gpg --dearmor
@@ -72,8 +89,10 @@ python3 -m venv venv
 source venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
-# emergentintegrations comes from a custom index
-pip install emergentintegrations --extra-index-url https://d33sy5i8bnduwe.cloudfront.net/simple/ || true
+# NOTE: emergentintegrations & the internal litellm wheel are intentionally NOT in
+# requirements.txt — they only exist inside Emergent's build environment. Razorpay
+# is the active payment path; the legacy Stripe endpoints degrade gracefully if the
+# module is absent (see server.py STRIPE_AVAILABLE flag).
 
 echo "==> [5/9] Writing backend/.env..."
 cat > "$INSTALL_DIR/backend/.env" <<EOF
@@ -94,6 +113,10 @@ echo "==> [6/9] Frontend build..."
 cd "$INSTALL_DIR/frontend"
 echo "REACT_APP_BACKEND_URL=${PUBLIC_APP_URL}" > "$INSTALL_DIR/frontend/.env"
 yarn install
+# Cap Node heap and disable sourcemaps to survive on 1GB droplets (with 2GB swap).
+export NODE_OPTIONS="--max-old-space-size=1536"
+export GENERATE_SOURCEMAP=false
+export CI=false
 yarn build
 
 echo "==> [7/9] Configuring Supervisor (backend)..."

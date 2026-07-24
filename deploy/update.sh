@@ -10,6 +10,20 @@ set -euo pipefail
 INSTALL_DIR="/opt/live-adda"
 cd "$INSTALL_DIR"
 
+# --- Ensure >=2GB swap so `yarn build` doesn't get OOM-killed on 1GB droplets ---
+CURRENT_SWAP_MB=$(free -m | awk '/^Swap:/ {print $2}')
+if [ "${CURRENT_SWAP_MB:-0}" -lt 2000 ]; then
+  echo "==> [0/5] Adding 2GB swap (current swap = ${CURRENT_SWAP_MB}MB)..."
+  swapoff /swapfile 2>/dev/null || true
+  rm -f /swapfile
+  fallocate -l 2G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=2048
+  chmod 600 /swapfile
+  mkswap /swapfile
+  swapon /swapfile
+  grep -q "/swapfile" /etc/fstab || echo "/swapfile none swap sw 0 0" >> /etc/fstab
+  sysctl vm.swappiness=10 || true
+fi
+
 echo "==> [1/5] Pulling latest code..."
 git pull
 
@@ -17,8 +31,8 @@ echo "==> [2/5] Backend deps + restart..."
 cd "$INSTALL_DIR/backend"
 source venv/bin/activate
 pip install -r requirements.txt
-# emergentintegrations comes from a custom index (safe to re-run)
-pip install emergentintegrations --extra-index-url https://d33sy5i8bnduwe.cloudfront.net/simple/ >/dev/null 2>&1 || true
+# NOTE: emergentintegrations/litellm are Emergent-internal and intentionally NOT
+# in requirements.txt. Stripe endpoints degrade gracefully if the module is absent.
 
 echo "    Checking required env vars in backend/.env ..."
 MISSING=0
@@ -38,6 +52,10 @@ supervisorctl restart live-adda-backend
 echo "==> [3/5] Frontend build..."
 cd "$INSTALL_DIR/frontend"
 yarn install
+# Cap Node heap and disable sourcemaps to survive on 1GB droplets (with 2GB swap).
+export NODE_OPTIONS="--max-old-space-size=1536"
+export GENERATE_SOURCEMAP=false
+export CI=false
 yarn build
 
 echo "==> [4/5] Reloading Nginx..."
