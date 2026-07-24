@@ -30,7 +30,7 @@ function App() {
               <Route path="support" element={<Support />} />
             </Route>
           </Routes>
-          <Toaster position="top-right" />
+          <Toaster position="bottom-right" />
         </BrowserRouter>
       </AuthProvider>
     </div>

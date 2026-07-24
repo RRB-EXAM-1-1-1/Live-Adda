@@ -97,3 +97,10 @@ Build "Live Adda" - a professional 24/7 YouTube Live streaming SaaS platform.
 - BUG: users with an active plan saw a disabled 'Current Plan' button, so they couldn't re-buy/recharge (e.g. the ₹35 Daily)
 - FIX: current plan button now enabled + labeled 'Renew / Recharge'; buying the same active plan STACKS duration onto remaining validity (expired/other plan resets from now)
 - Testing: 56/56 backend tests pass; fresh + existing-plan Billings UI verified, Razorpay modal opens for renewal
+
+## Iteration 6 (2026-07-24) - Fix 4 critical upload/auth/dashboard bugs
+- BUG 413 + tab-switch: replaced whole-file upload with CHUNKED upload (5MB slices, sequential, per-chunk retry) via /api/videos/upload/chunk - small requests avoid proxy 413 and survive flaky connections
+- BUG 'Not Authenticated': access token 15min->12h + new /api/auth/refresh endpoint + axios 401 auto-refresh interceptor
+- BUG dashboard plan: Dashboard now derives plan status from fresh /api/dashboard/stats (+ refreshUser on mount) instead of stale context
+- Toast moved to bottom-right (was overlapping Upload button)
+- Testing: 13 new tests pass (auth refresh + chunked upload + dashboard reflection); all 4 fixes verified end-to-end. NOTE: 8 backend failures are pre-existing Razorpay LIVE-key Cloudflare throttling in preview cluster (not a regression)
