@@ -12,6 +12,41 @@ const api = axios.create({
   }
 });
 
+// Auto-refresh: on a 401, try refreshing the access token once, then retry.
+let isRefreshing = false;
+let refreshPromise = null;
+
+api.interceptors.response.use(
+  (response) => response,
+  async (error) => {
+    const original = error.config;
+    const status = error.response?.status;
+    const url = original?.url || '';
+
+    // Don't try to refresh for the auth endpoints themselves
+    const isAuthCall = url.includes('/auth/login') || url.includes('/auth/register') || url.includes('/auth/refresh');
+
+    if (status === 401 && !original._retry && !isAuthCall) {
+      original._retry = true;
+      try {
+        if (!isRefreshing) {
+          isRefreshing = true;
+          refreshPromise = api.post('/auth/refresh');
+        }
+        await refreshPromise;
+        isRefreshing = false;
+        refreshPromise = null;
+        return api(original); // retry original request with new cookie
+      } catch (refreshErr) {
+        isRefreshing = false;
+        refreshPromise = null;
+        return Promise.reject(refreshErr);
+      }
+    }
+    return Promise.reject(error);
+  }
+);
+
 // Helper to format API errors
 const formatApiError = (error) => {
   if (error.response?.data?.detail) {
@@ -66,20 +101,52 @@ export const authAPI = {
 
 // Video APIs
 export const videoAPI = {
+  // Chunked upload: splits the file into small parts so it never trips proxy
+  // body-size limits (413), survives flaky connections, and keeps a smooth
+  // progress bar. Each chunk is retried once on transient failure.
   upload: async (file, title, onProgress) => {
-    try {
-      const formData = new FormData();
-      formData.append('file', file);
-      formData.append('title', title);
+    const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB per chunk
+    const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
+    const uploadId = `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 
-      const { data } = await api.post('/videos/upload', formData, {
-        headers: { 'Content-Type': 'multipart/form-data' },
-        onUploadProgress: (progressEvent) => {
-          const percentCompleted = Math.round((progressEvent.loaded * 100) / progressEvent.total);
-          if (onProgress) onProgress(percentCompleted);
+    try {
+      let lastData = null;
+      for (let index = 0; index < totalChunks; index++) {
+        const start = index * CHUNK_SIZE;
+        const blob = file.slice(start, Math.min(start + CHUNK_SIZE, file.size));
+
+        const formData = new FormData();
+        formData.append('upload_id', uploadId);
+        formData.append('chunk_index', index);
+        formData.append('total_chunks', totalChunks);
+        formData.append('filename', file.name);
+        formData.append('title', title);
+        formData.append('file', blob, file.name);
+
+        // Retry a chunk once if it fails transiently
+        let attempt = 0;
+        while (true) {
+          try {
+            const { data } = await api.post('/videos/upload/chunk', formData, {
+              headers: { 'Content-Type': 'multipart/form-data' },
+              timeout: 0, // no client timeout for uploads
+              onUploadProgress: (evt) => {
+                if (!onProgress) return;
+                const chunkLoaded = evt.total ? (evt.loaded / evt.total) * blob.size : 0;
+                const overall = Math.min(99, Math.round(((start + chunkLoaded) / file.size) * 100));
+                onProgress(overall);
+              }
+            });
+            lastData = data;
+            break;
+          } catch (err) {
+            attempt += 1;
+            if (attempt >= 2) throw err;
+          }
         }
-      });
-      return { data, error: null };
+      }
+      if (onProgress) onProgress(100);
+      return { data: lastData, error: null };
     } catch (error) {
       return { data: null, error: formatApiError(error) };
     }

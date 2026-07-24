@@ -121,7 +121,7 @@ def create_access_token(user_id: str, email: str) -> str:
     payload = {
         "sub": user_id,
         "email": email,
-        "exp": datetime.now(timezone.utc) + timedelta(minutes=15),
+        "exp": datetime.now(timezone.utc) + timedelta(hours=12),
         "type": "access"
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
@@ -244,7 +244,7 @@ async def register(user_data: UserRegister):
         httponly=True,
         secure=False,
         samesite="lax",
-        max_age=900,
+        max_age=43200,
         path="/"
     )
     response.set_cookie(
@@ -291,7 +291,7 @@ async def login(credentials: UserLogin):
         httponly=True,
         secure=False,
         samesite="lax",
-        max_age=900,
+        max_age=43200,
         path="/"
     )
     response.set_cookie(
@@ -312,6 +312,32 @@ async def logout():
     response = JSONResponse({"message": "Logged out successfully"})
     response.delete_cookie("access_token", path="/")
     response.delete_cookie("refresh_token", path="/")
+    return response
+
+@api_router.post("/auth/refresh")
+async def refresh_token(request: Request):
+    """Issue a new access token using the refresh_token cookie."""
+    token = request.cookies.get("refresh_token")
+    if not token:
+        raise HTTPException(status_code=401, detail="No refresh token")
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        if payload.get("type") != "refresh":
+            raise HTTPException(status_code=401, detail="Invalid token type")
+        user = await db.users.find_one({"user_id": payload["sub"]}, {"_id": 0})
+        if not user:
+            raise HTTPException(status_code=401, detail="User not found")
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Refresh token expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+
+    new_access = create_access_token(user["user_id"], user["email"])
+    response = JSONResponse({"message": "Token refreshed"})
+    response.set_cookie(
+        key="access_token", value=new_access, httponly=True,
+        secure=False, samesite="lax", max_age=43200, path="/"
+    )
     return response
 
 @api_router.get("/auth/me")
@@ -427,6 +453,95 @@ async def upload_video(
         "size": file_size,
         "uploaded_at": datetime.now(timezone.utc).isoformat(),
         "message": f"✅ Ready for the stream! Plan validity: {remaining_message}"
+    }
+
+def _plan_validity_message(user: dict) -> str:
+    plan_expires_at = user.get("plan_expires_at")
+    if not plan_expires_at:
+        return "No active plan"
+    if isinstance(plan_expires_at, str):
+        plan_expires_at = datetime.fromisoformat(plan_expires_at)
+    if plan_expires_at.tzinfo is None:
+        plan_expires_at = plan_expires_at.replace(tzinfo=timezone.utc)
+    remaining_seconds = (plan_expires_at - datetime.now(timezone.utc)).total_seconds()
+    remaining_days = int(remaining_seconds // 86400)
+    remaining_hours = int(remaining_seconds // 3600)
+    return f"{remaining_days} days remaining" if remaining_days >= 1 else f"{remaining_hours} hours remaining"
+
+@api_router.post("/videos/upload/chunk")
+async def upload_video_chunk(
+    upload_id: str = Form(...),
+    chunk_index: int = Form(...),
+    total_chunks: int = Form(...),
+    filename: str = Form(...),
+    title: str = Form(...),
+    file: UploadFile = File(...),
+    user: dict = Depends(get_current_user)
+):
+    """Chunked upload: receive one small chunk at a time and append it.
+    Small requests avoid proxy 413 limits and survive flaky connections.
+    On the final chunk the file is finalized and registered."""
+    await check_active_plan(user)
+
+    # Namespace the temp file by user to prevent collisions/abuse
+    safe_id = f"{user['user_id']}_{upload_id}".replace("/", "_")
+    tmp_dir = UPLOAD_DIR / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    part_path = tmp_dir / f"{safe_id}.part"
+
+    # Fresh start on first chunk
+    if chunk_index == 0 and part_path.exists():
+        part_path.unlink()
+
+    content = await file.read()
+    async with aiofiles.open(part_path, 'ab') as f:
+        await f.write(content)
+
+    # Enforce the 2GB budget incrementally
+    current_size = part_path.stat().st_size
+    remaining_budget = MAX_STORAGE_BYTES - user.get("storage_used", 0)
+    if current_size > remaining_budget:
+        part_path.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Storage limit exceeded. You have {MAX_STORAGE_BYTES / (1024**3):.0f} GB limit."
+        )
+
+    # Not the last chunk yet
+    if chunk_index + 1 < total_chunks:
+        return {"status": "chunk_received", "chunk_index": chunk_index}
+
+    # Final chunk -> finalize
+    video_id = f"video_{uuid.uuid4().hex[:12]}"
+    file_extension = Path(filename).suffix or ".mp4"
+    final_path = UPLOAD_DIR / f"{video_id}{file_extension}"
+    part_path.rename(final_path)
+    file_size = final_path.stat().st_size
+
+    video_doc = {
+        "video_id": video_id,
+        "user_id": user["user_id"],
+        "title": title,
+        "duration": "00:00",
+        "size": file_size,
+        "file_path": str(final_path),
+        "thumbnail_url": None,
+        "uploaded_at": datetime.now(timezone.utc),
+        "processing_status": "completed"
+    }
+    await db.videos.insert_one(video_doc)
+    await db.users.update_one(
+        {"user_id": user["user_id"]},
+        {"$inc": {"storage_used": file_size}}
+    )
+
+    return {
+        "status": "completed",
+        "video_id": video_id,
+        "title": title,
+        "size": file_size,
+        "uploaded_at": datetime.now(timezone.utc).isoformat(),
+        "message": f"✅ Ready for the stream! Plan validity: {_plan_validity_message(user)}"
     }
 
 @api_router.get("/videos")

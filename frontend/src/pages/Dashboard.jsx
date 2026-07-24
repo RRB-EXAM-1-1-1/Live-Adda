@@ -14,14 +14,19 @@ const formatBytes = (bytes) => {
 
 const Dashboard = () => {
   const navigate = useNavigate();
-  const { user } = useAuth();
+  const { user, refreshUser } = useAuth();
   const [stats, setStats] = useState(null);
   const [loading, setLoading] = useState(true);
 
-  const hasActivePlan = user?.plan && user?.plan_expires_at;
+  // Use fresh DB stats as the source of truth (falls back to auth context).
+  const planId = stats?.plan ?? user?.plan;
+  const planExpiry = stats?.plan_expires_at ?? user?.plan_expires_at;
+  const hasActivePlan = Boolean(planId && planExpiry && new Date(planExpiry) > new Date());
 
   useEffect(() => {
     loadStats();
+    // Keep the app-wide auth context in sync with the DB (e.g. after a purchase)
+    refreshUser();
   }, []);
 
   const loadStats = async () => {
@@ -34,8 +39,8 @@ const Dashboard = () => {
   };
 
   const getRemainingDays = () => {
-    if (!user?.plan_expires_at) return null;
-    const expiry = new Date(user.plan_expires_at);
+    if (!planExpiry) return null;
+    const expiry = new Date(planExpiry);
     const now = new Date();
     const days = Math.ceil((expiry - now) / (1000 * 60 * 60 * 24));
     return days > 0 ? days : 0;

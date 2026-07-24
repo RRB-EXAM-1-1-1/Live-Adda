@@ -1039,3 +1039,261 @@ class TestRazorpayVerifyPayment:
         # cleanup
         db = _get_mongo_db_static()
         db.users.delete_one({"email": email})
+
+
+# ==================== Iteration 6: Chunked Upload + Auth Refresh ====================
+
+import jwt as _jwt
+
+
+class TestAuthRefreshIter6:
+    """POST /api/auth/refresh - iteration 6"""
+
+    def test_refresh_without_cookie_returns_401(self):
+        r = requests.post(f"{API}/auth/refresh", timeout=15)
+        assert r.status_code == 401, r.text
+        assert r.json().get("detail") == "No refresh token"
+
+    def test_refresh_with_valid_cookie_issues_new_access_token(self, admin_session):
+        # admin_session already logged in; has both cookies
+        assert "refresh_token" in admin_session.cookies
+        old_access = admin_session.cookies.get("access_token")
+        # Need a small delay to guarantee a different token payload timestamp
+        time.sleep(1)
+        r = admin_session.post(f"{API}/auth/refresh", timeout=15)
+        assert r.status_code == 200, r.text
+        # New access_token cookie must be set
+        set_cookies = r.headers.get("set-cookie", "") or r.headers.get("Set-Cookie", "")
+        assert "access_token" in set_cookies.lower(), f"Set-Cookie: {set_cookies!r}"
+        new_access = admin_session.cookies.get("access_token")
+        assert new_access is not None
+        # /auth/me should still work with the new token
+        me = admin_session.get(f"{API}/auth/me", timeout=15)
+        assert me.status_code == 200
+
+    def test_refresh_after_removing_access_token_still_works(self, admin_session):
+        """Simulate the axios interceptor scenario: access_token missing but
+        refresh_token present -> /auth/refresh issues a fresh access_token so
+        a subsequent protected call succeeds."""
+        # Make a fresh session that copies only the refresh_token
+        s2 = requests.Session()
+        rt = admin_session.cookies.get("refresh_token")
+        assert rt, "admin_session missing refresh_token"
+        s2.cookies.set("refresh_token", rt)
+        # Without access_token, /auth/me should be 401
+        r0 = s2.get(f"{API}/auth/me", timeout=15)
+        assert r0.status_code == 401
+        # Refresh
+        r = s2.post(f"{API}/auth/refresh", timeout=15)
+        assert r.status_code == 200, r.text
+        # Now /auth/me should succeed
+        r2 = s2.get(f"{API}/auth/me", timeout=15)
+        assert r2.status_code == 200, r2.text
+
+    def test_refresh_rejects_invalid_refresh_token(self):
+        s = requests.Session()
+        s.cookies.set("refresh_token", "this.is.not.a.valid.jwt")
+        r = s.post(f"{API}/auth/refresh", timeout=15)
+        assert r.status_code == 401
+
+    def test_refresh_rejects_access_token_as_refresh(self, admin_session):
+        """Sending an access_token in the refresh_token cookie must be rejected
+        (type != 'refresh')."""
+        at = admin_session.cookies.get("access_token")
+        assert at
+        s = requests.Session()
+        s.cookies.set("refresh_token", at)
+        r = s.post(f"{API}/auth/refresh", timeout=15)
+        assert r.status_code == 401
+        assert r.json().get("detail") in ("Invalid token type", "Invalid refresh token")
+
+    def test_access_token_is_12h(self):
+        """Access token now has 12h lifetime (iteration 6 fix)."""
+        from pathlib import Path
+        env = Path("/app/backend/.env").read_text().splitlines()
+        secret = None
+        for line in env:
+            if line.startswith("JWT_SECRET="):
+                secret = line.split("=", 1)[1].strip().strip('"')
+                break
+        assert secret, "JWT_SECRET missing from .env"
+
+        s = requests.Session()
+        r = s.post(f"{API}/auth/login",
+                   json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD}, timeout=15)
+        assert r.status_code == 200
+        access = s.cookies.get("access_token")
+        assert access
+        payload = _jwt.decode(access, secret, algorithms=["HS256"])
+        # exp - iat approx 12h
+        exp = payload["exp"]
+        # Also allow verifying via 'exp' - now
+        from datetime import datetime, timezone as _tz
+        now_ts = int(datetime.now(_tz.utc).timestamp())
+        remaining = exp - now_ts
+        # Expect ~12h (43200s), with a couple minutes slack
+        assert 43000 <= remaining <= 43300, f"access token TTL not ~12h: {remaining}s"
+
+
+class TestChunkedUploadIter6:
+    """POST /api/videos/upload/chunk - iteration 6"""
+
+    def _split_and_upload(self, session, payload_bytes, filename, title,
+                         chunk_size=1024, expected_status=200):
+        upload_id = uuid.uuid4().hex[:16]
+        total_chunks = max(1, (len(payload_bytes) + chunk_size - 1) // chunk_size)
+        last = None
+        for i in range(total_chunks):
+            chunk = payload_bytes[i*chunk_size:(i+1)*chunk_size]
+            files = {"file": (filename, io.BytesIO(chunk), "application/octet-stream")}
+            data = {
+                "upload_id": upload_id,
+                "chunk_index": i,
+                "total_chunks": total_chunks,
+                "filename": filename,
+                "title": title,
+            }
+            r = session.post(f"{API}/videos/upload/chunk", files=files, data=data, timeout=60)
+            last = r
+            if r.status_code != 200:
+                return r, upload_id, total_chunks
+        return last, upload_id, total_chunks
+
+    def test_chunk_upload_without_plan_returns_403_with_exact_message(self, fresh_user):
+        s, _, _ = fresh_user
+        payload = b"A" * 100
+        r, _, _ = self._split_and_upload(s, payload, "np.mp4", "TEST_no_plan_chunk", chunk_size=50)
+        assert r.status_code == 403, r.text
+        # Accept either purchase message or expired variant
+        detail = r.json().get("detail", "")
+        assert detail == GATEKEEP_MSG or "expired" in detail.lower(), f"Unexpected: {detail!r}"
+
+    def test_chunk_upload_success_reassembles_and_creates_video(self, admin_session):
+        # Get storage_used before
+        me0 = admin_session.get(f"{API}/auth/me", timeout=15).json()
+        before = me0.get("storage_used", 0)
+        payload = os.urandom(5000)  # 5KB
+        chunk_size = 1500  # -> 4 chunks
+        r, upload_id, total_chunks = self._split_and_upload(
+            admin_session, payload, "chunk_test.mp4",
+            "TEST_chunked_upload", chunk_size=chunk_size)
+        assert r.status_code == 200, r.text
+        resp = r.json()
+        assert resp["status"] == "completed", resp
+        assert "video_id" in resp
+        assert resp["size"] == len(payload), (resp["size"], len(payload))
+        assert "Ready for the stream!" in resp["message"]
+        vid = resp["video_id"]
+        # storage_used incremented
+        me1 = admin_session.get(f"{API}/auth/me", timeout=15).json()
+        assert me1["storage_used"] == before + len(payload), (before, me1["storage_used"])
+        # Video appears in listing
+        lst = admin_session.get(f"{API}/videos", timeout=15).json()
+        assert any(v["video_id"] == vid for v in lst), "video not present in listing"
+        found = next(v for v in lst if v["video_id"] == vid)
+        assert found["size"] == len(payload)
+        assert found["title"] == "TEST_chunked_upload"
+        # Cleanup
+        admin_session.delete(f"{API}/videos/{vid}", timeout=15)
+
+    def test_chunk_non_final_returns_chunk_received(self, admin_session):
+        upload_id = uuid.uuid4().hex[:16]
+        files = {"file": ("part.mp4", io.BytesIO(b"a" * 100), "application/octet-stream")}
+        data = {
+            "upload_id": upload_id,
+            "chunk_index": 0,
+            "total_chunks": 3,
+            "filename": "part.mp4",
+            "title": "TEST_partial_chunk",
+        }
+        r = admin_session.post(f"{API}/videos/upload/chunk", files=files, data=data, timeout=30)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body.get("status") == "chunk_received"
+        assert body.get("chunk_index") == 0
+        # Cleanup partial file
+        from pathlib import Path as _P
+        me = admin_session.get(f"{API}/auth/me", timeout=15).json()
+        p = _P("/app/backend/uploads/tmp") / f"{me['user_id']}_{upload_id}.part"
+        if p.exists():
+            p.unlink()
+
+    def test_chunk_upload_storage_limit_exceeded_returns_400(self, admin_session):
+        """Set storage_used near the 2GB limit and try to upload a payload that
+        exceeds the remaining budget."""
+        from pymongo import MongoClient
+        from pathlib import Path
+        env = Path("/app/backend/.env").read_text().splitlines()
+        cfg = {}
+        for line in env:
+            if "=" in line and not line.startswith("#"):
+                k, v = line.split("=", 1)
+                cfg[k.strip()] = v.strip().strip('"')
+        cli = MongoClient(cfg["MONGO_URL"])
+        db = cli[cfg["DB_NAME"]]
+        me = admin_session.get(f"{API}/auth/me", timeout=15).json()
+        uid = me["user_id"]
+        original = me.get("storage_used", 0)
+        MAX = 2 * 1024 * 1024 * 1024
+        # 512 bytes remaining
+        db.users.update_one({"user_id": uid}, {"$set": {"storage_used": MAX - 512}})
+        try:
+            # Upload 2KB in two 1KB chunks - should be rejected during first or second chunk
+            payload = b"x" * 2048
+            r, upload_id, _ = self._split_and_upload(
+                admin_session, payload, "big.mp4",
+                "TEST_over_limit_chunk", chunk_size=1024)
+            assert r.status_code == 400, f"expected 400, got {r.status_code}: {r.text}"
+            assert "Storage limit" in r.json().get("detail", "")
+        finally:
+            db.users.update_one({"user_id": uid}, {"$set": {"storage_used": original}})
+
+    def test_chunk_upload_first_chunk_wipes_previous_partial(self, admin_session):
+        """If a previous aborted upload left a .part file, sending chunk_index=0
+        must start fresh (not append)."""
+        from pathlib import Path as _P
+        me = admin_session.get(f"{API}/auth/me", timeout=15).json()
+        uid = me["user_id"]
+        upload_id = uuid.uuid4().hex[:16]
+        tmp = _P("/app/backend/uploads/tmp")
+        tmp.mkdir(parents=True, exist_ok=True)
+        part = tmp / f"{uid}_{upload_id}.part"
+        part.write_bytes(b"GARBAGE" * 100)  # 700 bytes of stale data
+
+        payload = os.urandom(1500)
+        # Single chunk covering the whole payload
+        files = {"file": ("clean.mp4", io.BytesIO(payload), "application/octet-stream")}
+        data = {
+            "upload_id": upload_id,
+            "chunk_index": 0,
+            "total_chunks": 1,
+            "filename": "clean.mp4",
+            "title": "TEST_chunk_wipes_stale",
+        }
+        r = admin_session.post(f"{API}/videos/upload/chunk", files=files, data=data, timeout=30)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["status"] == "completed"
+        # Size MUST be len(payload) - proving the stale bytes were dropped
+        assert body["size"] == len(payload), (body["size"], len(payload))
+        admin_session.delete(f"{API}/videos/{body['video_id']}", timeout=15)
+
+
+class TestDashboardStatsPlanReflection:
+    """Iteration 6: /api/dashboard/stats must return `plan` and `plan_expires_at`
+    (used by the Dashboard to render Plan Validity)."""
+
+    def test_stats_has_plan_and_expiry_for_active_user(self, admin_session):
+        r = admin_session.get(f"{API}/dashboard/stats", timeout=15)
+        assert r.status_code == 200
+        data = r.json()
+        assert data.get("plan") == "monthly"
+        assert data.get("plan_expires_at") is not None
+
+    def test_stats_no_plan_for_fresh_user(self, fresh_user):
+        s, _, _ = fresh_user
+        r = s.get(f"{API}/dashboard/stats", timeout=15)
+        assert r.status_code == 200
+        data = r.json()
+        assert data.get("plan") is None
+        assert data.get("plan_expires_at") is None
