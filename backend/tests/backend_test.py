@@ -1742,3 +1742,304 @@ class TestIter8Sitemap:
         r = requests.get(f"{BASE_URL}/robots.txt", timeout=15)
         assert r.status_code == 200
         assert "User-agent" in r.text or "Sitemap" in r.text
+
+
+# ==================== ITERATION 9 TESTS ====================
+
+class TestIter9Health:
+    """GET /api/health public endpoint."""
+
+    def test_health_no_auth_and_shape(self):
+        r = requests.get(f"{API}/health", timeout=15)
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert data.get("status") == "ok", data
+        assert data.get("db") == "ok", data
+        # build_sha should not be the literal 'unknown'
+        sha = data.get("build_sha")
+        assert isinstance(sha, str) and sha and sha != "unknown", f"bad build_sha: {sha!r}"
+        # short git SHA is typically 7 chars but can be up to 40
+        assert 4 <= len(sha) <= 40, f"unexpected sha length: {sha!r}"
+        # server_time is ISO
+        st = data.get("server_time", "")
+        assert "T" in st and len(st) >= 19, f"bad server_time: {st!r}"
+        # features flags
+        f = data.get("features", {})
+        for key in ("chunked_upload", "resumable_upload", "video_thumbnails",
+                    "ffprobe_metadata", "multi_slot_streaming", "razorpay"):
+            assert f.get(key) is True, f"feature flag {key} missing/false: {f}"
+
+
+class TestIter9StreamsList:
+    """GET /api/streams returns active list + slot budget."""
+
+    def test_admin_streams_empty_default(self, admin_session):
+        # Clean any leftover live streams first
+        db = _get_mongo_db_static()
+        me = admin_session.get(f"{API}/auth/me", timeout=15).json()
+        db.live_streams.update_many(
+            {"user_id": me["user_id"], "is_live": True},
+            {"$set": {"is_live": False, "ffmpeg_pid": None}}
+        )
+        r = admin_session.get(f"{API}/streams", timeout=15)
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert data == {"active": [], "count": 0, "max_slots": 3, "slots_available": 3} \
+            or (data["count"] == 0 and data["max_slots"] == 3 and data["slots_available"] == 3), data
+
+    def test_fresh_user_max_slots_is_1(self, key_user):
+        s, email, uid = key_user
+        r = s.get(f"{API}/streams", timeout=15)
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert data["max_slots"] == 1, data
+        assert data["count"] == 0
+        assert data["slots_available"] == 1
+
+
+class TestIter9MultiSlot:
+    """Multi-slot enforcement via seeded live_streams (no ffmpeg spawn).
+
+    We seed is_live=True docs directly for admin so we can validate the
+    count-check that runs BEFORE ffmpeg_service.start_ffmpeg_push. Then a real
+    4th call should 403 without ever hitting ffmpeg.
+
+    Also validates duplicate-key protection (409) — key check runs before the
+    slot-count block only for the duplicate scenario? Actually the code checks
+    slot budget first, then dup key. So for dup test we seed 1 active slot and
+    call with same key => still gated by slot but only if budget full. We test
+    dup with the same key while under limit.
+    """
+
+    def _cleanup(self, uid):
+        db = _get_mongo_db_static()
+        db.live_streams.delete_many({"user_id": uid, "stream_key": {"$regex": "^KEY-"}})
+
+    def _get_admin_uid(self, admin_session):
+        return admin_session.get(f"{API}/auth/me", timeout=15).json()["user_id"]
+
+    def _get_video_id(self, admin_session):
+        r = admin_session.get(f"{API}/videos", timeout=15)
+        assert r.status_code == 200
+        vids = r.json()
+        if isinstance(vids, dict):
+            vids = vids.get("videos", [])
+        if not vids:
+            # upload one
+            import shutil
+            path = "/tmp/tiny.mp4"
+            if not os.path.exists(path):
+                os.system(f"ffmpeg -y -f lavfi -i testsrc=duration=5:size=640x360:rate=15 -pix_fmt yuv420p {path} > /dev/null 2>&1")
+            with open(path, "rb") as f:
+                content = f.read()
+            upload_id = uuid.uuid4().hex[:16]
+            files = {"file": ("tiny.mp4", io.BytesIO(content), "video/mp4")}
+            data = {"upload_id": upload_id, "chunk_index": 0, "total_chunks": 1,
+                    "filename": "tiny.mp4", "title": "TEST_iter9_slotvid", "offset": 0}
+            r = admin_session.post(f"{API}/videos/upload/chunk", files=files, data=data, timeout=60)
+            assert r.status_code == 200, r.text
+            return r.json()["video_id"]
+        return vids[0]["video_id"]
+
+    def test_multi_slot_count_enforcement_via_seed(self, admin_session):
+        """Seed 3 live streams => 4th real POST returns 403 (count check before ffmpeg)."""
+        from datetime import datetime, timezone
+        uid = self._get_admin_uid(admin_session)
+        db = _get_mongo_db_static()
+        # Cleanup first
+        db.live_streams.delete_many({"user_id": uid})
+        try:
+            for i, k in enumerate(["KEY-A", "KEY-B", "KEY-C"]):
+                db.live_streams.insert_one({
+                    "stream_id": f"seed_{i}_{uuid.uuid4().hex[:8]}",
+                    "user_id": uid, "is_live": True, "stream_key": k,
+                    "ffmpeg_pid": None, "started_at": datetime.now(timezone.utc),
+                    "current_video": "seeded", "video_id": "seedvid", "stream_method": "manual_key",
+                })
+            # List should show 3
+            lr = admin_session.get(f"{API}/streams", timeout=15).json()
+            assert lr["count"] == 3, lr
+            assert lr["max_slots"] == 3
+            assert lr["slots_available"] == 0
+
+            # 4th real call → 403 (no ffmpeg spawn because count check first)
+            vid = self._get_video_id(admin_session)
+            r = admin_session.post(f"{API}/stream/start-with-key",
+                                    json={"video_id": vid, "stream_key": "KEY-D", "loop": True},
+                                    timeout=15)
+            assert r.status_code == 403, f"expected 403 got {r.status_code}: {r.text}"
+            assert "maximum of 3" in r.text, r.text
+        finally:
+            db.live_streams.delete_many({"user_id": uid})
+
+    def test_duplicate_stream_key_returns_409(self, admin_session):
+        from datetime import datetime, timezone
+        uid = self._get_admin_uid(admin_session)
+        db = _get_mongo_db_static()
+        db.live_streams.delete_many({"user_id": uid})
+        try:
+            # Seed 1 live stream under limit
+            db.live_streams.insert_one({
+                "stream_id": f"seed_dup_{uuid.uuid4().hex[:8]}",
+                "user_id": uid, "is_live": True, "stream_key": "KEY-DUP",
+                "ffmpeg_pid": None, "started_at": datetime.now(timezone.utc),
+                "current_video": "seeded", "video_id": "seedvid", "stream_method": "manual_key",
+            })
+            vid = self._get_video_id(admin_session)
+            r = admin_session.post(f"{API}/stream/start-with-key",
+                                    json={"video_id": vid, "stream_key": "KEY-DUP", "loop": True},
+                                    timeout=15)
+            assert r.status_code == 409, f"expected 409, got {r.status_code}: {r.text}"
+            assert "already live" in r.text.lower(), r.text
+        finally:
+            db.live_streams.delete_many({"user_id": uid})
+
+    def test_stop_specific_stream_by_id(self, admin_session):
+        from datetime import datetime, timezone
+        uid = self._get_admin_uid(admin_session)
+        db = _get_mongo_db_static()
+        db.live_streams.delete_many({"user_id": uid})
+        try:
+            ids = []
+            for k in ["KEY-X1", "KEY-X2", "KEY-X3"]:
+                sid = f"seed_stop_{uuid.uuid4().hex[:8]}"
+                db.live_streams.insert_one({
+                    "stream_id": sid, "user_id": uid, "is_live": True,
+                    "stream_key": k, "ffmpeg_pid": None,
+                    "started_at": datetime.now(timezone.utc),
+                    "current_video": "seeded", "video_id": "seedvid", "stream_method": "manual_key",
+                })
+                ids.append(sid)
+            # stop the middle one
+            target = ids[1]
+            r = admin_session.post(f"{API}/stream/stop", json={"stream_id": target}, timeout=15)
+            assert r.status_code == 200, r.text
+            # verify
+            listing = admin_session.get(f"{API}/streams", timeout=15).json()
+            active_ids = [s["stream_id"] for s in listing["active"]]
+            assert target not in active_ids, f"{target} still active: {active_ids}"
+            assert set(active_ids) == {ids[0], ids[2]}, active_ids
+            assert listing["count"] == 2
+            # stop w/o body => stops most recent (ids[2] most-recent since inserted last)
+            r2 = admin_session.post(f"{API}/stream/stop", json={}, timeout=15)
+            assert r2.status_code == 200, r2.text
+            listing2 = admin_session.get(f"{API}/streams", timeout=15).json()
+            assert listing2["count"] == 1
+        finally:
+            db.live_streams.delete_many({"user_id": uid})
+
+
+class TestIter9SingleSlotRegression:
+    """Fresh daily user cannot start a 2nd concurrent stream."""
+
+    def test_daily_user_2nd_stream_403(self, key_user):
+        from datetime import datetime, timezone
+        s, email, uid = key_user
+        db = _get_mongo_db_static()
+        db.live_streams.delete_many({"user_id": uid})
+        try:
+            # seed 1 live
+            db.live_streams.insert_one({
+                "stream_id": f"seed_single_{uuid.uuid4().hex[:8]}",
+                "user_id": uid, "is_live": True, "stream_key": "USER-A",
+                "ffmpeg_pid": None, "started_at": datetime.now(timezone.utc),
+                "current_video": "seeded", "video_id": "seedvid", "stream_method": "manual_key",
+            })
+            # Need a video owned by this user — since we haven't uploaded any,
+            # the endpoint would 404 on video lookup BEFORE hitting slot check.
+            # server order: check_active_plan -> stream_key check -> video lookup -> slot count.
+            # So we must seed a video doc.
+            db.videos.insert_one({
+                "video_id": "seedvid_user", "user_id": uid, "title": "TEST_seed",
+                "file_path": "/tmp/tiny.mp4", "duration": 0
+            })
+            r = s.post(f"{API}/stream/start-with-key",
+                        json={"video_id": "seedvid_user", "stream_key": "USER-B", "loop": True},
+                        timeout=15)
+            assert r.status_code == 403, f"expected 403, got {r.status_code}: {r.text}"
+            assert "maximum of 1" in r.text, r.text
+        finally:
+            db.live_streams.delete_many({"user_id": uid})
+            db.videos.delete_many({"video_id": "seedvid_user"})
+
+
+class TestIter9FfprobeMetadata:
+    """After finalize, GET /api/videos returns duration/width/height for uploaded MP4."""
+
+    def test_ffprobe_populated(self, admin_session):
+        import shutil
+        if not shutil.which("ffprobe") or not shutil.which("ffmpeg"):
+            pytest.skip("ffmpeg/ffprobe not installed")
+        path = "/tmp/iter9_probe.mp4"
+        os.system(f"ffmpeg -y -f lavfi -i testsrc=duration=5:size=640x360:rate=15 -pix_fmt yuv420p {path} > /dev/null 2>&1")
+        assert os.path.exists(path)
+        with open(path, "rb") as f:
+            content = f.read()
+        upload_id = uuid.uuid4().hex[:16]
+        files = {"file": ("iter9_probe.mp4", io.BytesIO(content), "video/mp4")}
+        data = {"upload_id": upload_id, "chunk_index": 0, "total_chunks": 1,
+                "filename": "iter9_probe.mp4", "title": "TEST_iter9_probe", "offset": 0}
+        r = admin_session.post(f"{API}/videos/upload/chunk", files=files, data=data, timeout=60)
+        assert r.status_code == 200, r.text
+        vid = r.json()["video_id"]
+        try:
+            # brief wait for ffprobe extraction
+            time.sleep(2)
+            lst = admin_session.get(f"{API}/videos", timeout=15).json()
+            videos = lst.get("videos", lst) if isinstance(lst, dict) else lst
+            match = next((v for v in videos if v["video_id"] == vid), None)
+            assert match is not None, "uploaded video not returned"
+            assert match.get("duration_seconds", 0) in range(3, 8), match
+            assert match.get("width") == 640, match
+            assert match.get("height") == 360, match
+            dur = match.get("duration", "")
+            assert "5" in dur or "05" in dur, f"unexpected duration string: {dur!r}"
+        finally:
+            admin_session.delete(f"{API}/videos/{vid}", timeout=15)
+
+
+class TestIter9DashboardStats:
+    """dashboard/stats reflects multi-slot counts."""
+
+    def test_stats_active_live_slots(self, admin_session):
+        from datetime import datetime, timezone
+        uid = admin_session.get(f"{API}/auth/me", timeout=15).json()["user_id"]
+        db = _get_mongo_db_static()
+        db.live_streams.delete_many({"user_id": uid})
+        try:
+            # baseline
+            r0 = admin_session.get(f"{API}/dashboard/stats", timeout=15)
+            assert r0.status_code == 200
+            j0 = r0.json()
+            assert j0.get("active_live_slots") == 0, j0
+            assert j0.get("max_stream_slots") == 3, j0
+            # seed 2
+            for k in ["STAT-A", "STAT-B"]:
+                db.live_streams.insert_one({
+                    "stream_id": f"seed_stat_{uuid.uuid4().hex[:8]}",
+                    "user_id": uid, "is_live": True, "stream_key": k,
+                    "ffmpeg_pid": None, "started_at": datetime.now(timezone.utc),
+                    "current_video": "seeded", "video_id": "seedvid", "stream_method": "manual_key",
+                })
+            r1 = admin_session.get(f"{API}/dashboard/stats", timeout=15).json()
+            assert r1.get("active_live_slots") == 2, r1
+            assert r1.get("max_stream_slots") == 3, r1
+        finally:
+            db.live_streams.delete_many({"user_id": uid})
+
+
+class TestIter9GSCFile:
+    """Google Search Console verification file at public/ root."""
+
+    def test_gsc_file_reachable(self):
+        r = requests.get(f"{BASE_URL}/google217b552950b617e1.html", timeout=15)
+        assert r.status_code == 200, f"{r.status_code}: {r.text[:200]}"
+        body = r.text.strip()
+        assert body == "google-site-verification: google217b552950b617e1.html", f"body was: {body!r}"
+
+    def test_index_html_meta_gsc_token(self):
+        r = requests.get(f"{BASE_URL}/", timeout=15)
+        assert r.status_code == 200
+        assert 'name="google-site-verification"' in r.text
+        assert 'content="google217b552950b617e1"' in r.text
+        assert "REPLACE_WITH_YOUR_GSC_TOKEN" not in r.text

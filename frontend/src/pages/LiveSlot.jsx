@@ -35,8 +35,30 @@ const LiveSlot = () => {
   const [streamKey, setStreamKey] = useState('');
   const [keyVideo, setKeyVideo] = useState('');
   const [keyLoading, setKeyLoading] = useState(false);
+  // Multi-slot: track all live streams + slot budget
+  const [activeStreams, setActiveStreams] = useState([]);
+  const [slotInfo, setSlotInfo] = useState({ count: 0, max_slots: 1, slots_available: 1 });
 
   const hasActivePlan = user?.plan && user?.plan_expires_at;
+
+  const loadActiveStreams = async () => {
+    const { data } = await youtubeAPI.listStreams();
+    if (data) {
+      setActiveStreams(data.active || []);
+      setSlotInfo({ count: data.count || 0, max_slots: data.max_slots || 1, slots_available: data.slots_available ?? (data.max_slots - data.count) });
+      setIsLive((data.count || 0) > 0);
+    }
+  };
+
+  const handleStopSpecific = async (streamId) => {
+    const { data, error } = await youtubeAPI.stopStream(streamId);
+    if (data) {
+      toast.success('Stream stopped');
+      await loadActiveStreams();
+    } else {
+      toast.error(error || 'Failed to stop stream');
+    }
+  };
 
   const handleStartWithKey = async () => {
     if (!hasActivePlan) {
@@ -56,7 +78,10 @@ const LiveSlot = () => {
     setKeyLoading(false);
     if (data) {
       setIsLive(true);
-      toast.success(data.message || 'You are now live on YouTube!');
+      const slotMsg = data.slot ? ` (Slot ${data.slot.used}/${data.slot.max})` : '';
+      toast.success((data.message || 'You are now live on YouTube!') + slotMsg);
+      setStreamKey(''); // clear key so it isn't accidentally reused
+      await loadActiveStreams();
       loadStreamStatus();
     } else {
       toast.error(error || 'Failed to start stream');
@@ -80,6 +105,7 @@ const LiveSlot = () => {
     if (hasActivePlan) {
       loadStreamStatus();
       loadVideos();
+      loadActiveStreams();
     }
     loadYoutubeStatus();
 
@@ -200,10 +226,74 @@ const LiveSlot = () => {
   return (
     <div className="space-y-8" data-testid="live-slot-page">
       {/* Header */}
-      <div>
-        <h1 className="text-3xl font-bold text-white mb-2">Live Slot Management</h1>
-        <p className="text-gray-400">Configure and manage your live streaming slots</p>
+      <div className="flex items-start justify-between flex-wrap gap-4">
+        <div>
+          <h1 className="text-3xl font-bold text-white mb-2">Live Slot Management</h1>
+          <p className="text-gray-400">Configure and manage your live streaming slots</p>
+        </div>
+        {hasActivePlan && (
+          <div
+            data-testid="slot-budget-badge"
+            className="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-gray-800/70 border border-gray-700"
+          >
+            <span className={`w-2 h-2 rounded-full ${slotInfo.count > 0 ? 'bg-red-500 animate-pulse' : 'bg-gray-500'}`} />
+            <span className="text-white font-semibold text-sm">
+              Streams: {slotInfo.count} / {slotInfo.max_slots}
+            </span>
+          </div>
+        )}
       </div>
+
+      {/* Active Streams (multi-slot) */}
+      {hasActivePlan && activeStreams.length > 0 && (
+        <div
+          data-testid="active-streams-list"
+          className="bg-gray-800/50 backdrop-blur-lg rounded-2xl p-6 border border-red-500/30"
+        >
+          <h2 className="text-xl font-bold text-white mb-4 flex items-center gap-2">
+            <Radio className="w-5 h-5 text-red-400 animate-pulse" />
+            Active Streams
+          </h2>
+          <div className="space-y-3">
+            {activeStreams.map((s) => (
+              <div
+                key={s.stream_id}
+                data-testid={`active-stream-${s.stream_id}`}
+                className="flex items-center justify-between gap-4 p-4 bg-gray-900/60 rounded-xl border border-gray-700"
+              >
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2 mb-1">
+                    <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
+                    <span className="text-white font-semibold truncate">{s.current_video || 'Live stream'}</span>
+                  </div>
+                  <p className="text-gray-500 text-xs">
+                    Started {s.started_at ? new Date(s.started_at).toLocaleString() : '—'} · Slot ID: {s.stream_id.slice(-6)}
+                  </p>
+                </div>
+                <Button
+                  size="sm"
+                  variant="destructive"
+                  onClick={() => handleStopSpecific(s.stream_id)}
+                  data-testid={`stop-stream-${s.stream_id}`}
+                >
+                  <StopCircle className="w-4 h-4 mr-1" />
+                  Stop
+                </Button>
+              </div>
+            ))}
+          </div>
+          {slotInfo.slots_available > 0 && (
+            <p className="text-emerald-400 text-xs mt-3">
+              {slotInfo.slots_available} more slot{slotInfo.slots_available !== 1 ? 's' : ''} available — start another stream with a different YouTube key below.
+            </p>
+          )}
+          {slotInfo.slots_available === 0 && (
+            <p className="text-amber-400 text-xs mt-3">
+              All {slotInfo.max_slots} slot{slotInfo.max_slots !== 1 ? 's' : ''} in use. Stop one above to free up a slot.
+            </p>
+          )}
+        </div>
+      )}
 
       {/* No Plan Warning */}
       {!hasActivePlan && (

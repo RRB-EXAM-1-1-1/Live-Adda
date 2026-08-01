@@ -732,11 +732,64 @@ async def upload_video_chunk(
     except Exception as e:
         logger.warning(f"Thumbnail generation failed for {video_id}: {e}")
 
+    # Extract duration + resolution via ffprobe (non-blocking; JSON output)
+    duration_seconds = 0
+    duration_str = "00:00"
+    width = 0
+    height = 0
+    try:
+        probe = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "format=duration:stream=width,height",
+            "-of", "csv=p=0", str(final_path),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(probe.communicate(), timeout=6.0)
+        except asyncio.TimeoutError:
+            try: probe.kill()
+            except Exception: pass
+            stdout = b""
+        # ffprobe csv output shape: "1920,1080\n<seconds>\n"
+        lines = [ln.strip() for ln in stdout.decode(errors="ignore").splitlines() if ln.strip()]
+        for ln in lines:
+            if "," in ln and width == 0:
+                w, _, h = ln.partition(",")
+                try:
+                    width = int(w); height = int(h.split(",")[0])
+                except Exception:
+                    pass
+            else:
+                try:
+                    duration_seconds = int(float(ln))
+                except Exception:
+                    pass
+        if duration_seconds > 0:
+            mins, secs = divmod(duration_seconds, 60)
+            hrs, mins = divmod(mins, 60)
+            duration_str = (f"{hrs}:{mins:02d}:{secs:02d}" if hrs else f"{mins}:{secs:02d}")
+        if duration_seconds or width or height:
+            await db.videos.update_one(
+                {"video_id": video_id},
+                {"$set": {
+                    "duration": duration_str,
+                    "duration_seconds": duration_seconds,
+                    "width": width,
+                    "height": height,
+                }}
+            )
+    except Exception as e:
+        logger.warning(f"ffprobe metadata extraction failed for {video_id}: {e}")
+
     return {
         "status": "completed",
         "video_id": video_id,
         "title": title,
         "size": file_size,
+        "duration": duration_str,
+        "duration_seconds": duration_seconds,
+        "width": width,
+        "height": height,
         "thumbnail_url": f"/api/videos/{video_id}/thumbnail",
         "uploaded_at": datetime.now(timezone.utc).isoformat(),
         "message": f"✅ Ready for the stream! Plan validity: {_plan_validity_message(user)}"
@@ -1455,13 +1508,32 @@ async def youtube_stop_broadcast(user: dict = Depends(get_current_user)):
     )
     return {"message": "Broadcast stopped"}
 
-# ==================== STREAM WITH KEY (Key Activation) ====================
+# ==================== STREAM WITH KEY (Multi-slot support) ====================
+
+@api_router.get("/streams")
+async def list_active_streams(user: dict = Depends(get_current_user)):
+    """Return all currently-live streams for the user + their slot budget."""
+    streams = await db.live_streams.find(
+        {"user_id": user["user_id"], "is_live": True},
+        {"_id": 0, "ffmpeg_pid": 0}
+    ).sort("started_at", -1).to_list(50)
+    # Serialize datetime
+    for s in streams:
+        if s.get("started_at"):
+            s["started_at"] = s["started_at"].isoformat() if hasattr(s["started_at"], "isoformat") else str(s["started_at"])
+    max_slots = user.get("stream_slots", 1)
+    return {
+        "active": streams,
+        "count": len(streams),
+        "max_slots": max_slots,
+        "slots_available": max(0, max_slots - len(streams)),
+    }
+
 
 @api_router.post("/stream/start-with-key")
 async def start_stream_with_key(data: StreamKeyStart, user: dict = Depends(get_current_user)):
     """Go live by entering a YouTube stream key directly (no OAuth needed).
-    Requires an active plan (slot). Pushes the selected video to YouTube RTMP."""
-    # Gatekeeping: must have an active plan/slot
+    Enforces the user's concurrent-stream slot budget (default 1, admin lifetime = 3)."""
     await check_active_plan(user)
 
     stream_key = data.stream_key.strip()
@@ -1474,10 +1546,26 @@ async def start_stream_with_key(data: StreamKeyStart, user: dict = Depends(get_c
     if not video:
         raise HTTPException(status_code=404, detail="Video not found")
 
-    # If a stream is already running, stop it first to avoid orphan ffmpeg
-    existing = await db.live_streams.find_one({"user_id": user["user_id"]}, {"_id": 0})
-    if existing and existing.get("ffmpeg_pid"):
-        youtube_service.stop_ffmpeg_push(existing["ffmpeg_pid"])
+    # Enforce concurrent-stream slot budget
+    max_slots = user.get("stream_slots", 1)
+    active_count = await db.live_streams.count_documents(
+        {"user_id": user["user_id"], "is_live": True}
+    )
+    if active_count >= max_slots:
+        raise HTTPException(
+            status_code=403,
+            detail=f"You already have {active_count} live stream(s), which is your maximum of {max_slots}. Stop an existing stream before starting another."
+        )
+
+    # Prevent the exact same stream_key from being used twice concurrently on this account
+    dup = await db.live_streams.find_one(
+        {"user_id": user["user_id"], "is_live": True, "stream_key": stream_key}
+    )
+    if dup:
+        raise HTTPException(
+            status_code=409,
+            detail="This stream key is already live in another slot. Stop that stream first or use a different key."
+        )
 
     try:
         pid = youtube_service.start_ffmpeg_push(video["file_path"], stream_key, loop=data.loop)
@@ -1485,39 +1573,62 @@ async def start_stream_with_key(data: StreamKeyStart, user: dict = Depends(get_c
         logger.error(f"Failed to start ffmpeg with key: {e}")
         raise HTTPException(status_code=500, detail="Failed to start the video encoder.")
 
-    await db.live_streams.update_one(
-        {"user_id": user["user_id"]},
-        {"$set": {
-            "user_id": user["user_id"],
-            "is_live": True,
-            "current_video": video["title"],
-            "stream_method": "manual_key",
-            "ffmpeg_pid": pid,
-            "started_at": datetime.now(timezone.utc),
-        }},
-        upsert=True,
-    )
+    stream_id = f"stream_{uuid.uuid4().hex[:12]}"
+    stream_doc = {
+        "stream_id": stream_id,
+        "user_id": user["user_id"],
+        "is_live": True,
+        "current_video": video["title"],
+        "video_id": video["video_id"],
+        "stream_method": "manual_key",
+        "stream_key": stream_key,  # stored so we can dedupe & audit
+        "ffmpeg_pid": pid,
+        "started_at": datetime.now(timezone.utc),
+    }
+    await db.live_streams.insert_one(stream_doc)
+
     return {
         "message": "You are now live on YouTube!",
+        "stream_id": stream_id,
         "current_video": video["title"],
+        "slot": {"used": active_count + 1, "max": max_slots},
         "watch_hint": "Open YouTube Studio to view your live stream."
     }
 
+
 @api_router.post("/stream/stop")
-async def stop_stream_with_key(user: dict = Depends(get_current_user)):
-    """Stop the manual-key stream (kills the ffmpeg push). Idempotent."""
-    stream = await db.live_streams.find_one({"user_id": user["user_id"]}, {"_id": 0})
-    if not stream or not stream.get("is_live"):
+async def stop_stream_with_key(
+    request: Request,
+    user: dict = Depends(get_current_user)
+):
+    """Stop a manual-key stream. If body contains {stream_id: "..."}, stop that
+    specific stream. Otherwise stop the MOST RECENT live stream (back-compat for
+    single-slot users). Idempotent."""
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    target_stream_id = (body or {}).get("stream_id")
+
+    query = {"user_id": user["user_id"], "is_live": True}
+    if target_stream_id:
+        query["stream_id"] = target_stream_id
+    stream = await db.live_streams.find_one(query, sort=[("started_at", -1)])
+    if not stream:
         return {"message": "Already stopped"}
 
     if stream.get("ffmpeg_pid"):
-        youtube_service.stop_ffmpeg_push(stream["ffmpeg_pid"])
+        try:
+            youtube_service.stop_ffmpeg_push(stream["ffmpeg_pid"])
+        except Exception as e:
+            logger.warning(f"stop_ffmpeg_push failed: {e}")
 
     await db.live_streams.update_one(
-        {"user_id": user["user_id"]},
-        {"$set": {"is_live": False, "ffmpeg_pid": None}}
+        {"_id": stream["_id"]},
+        {"$set": {"is_live": False, "ffmpeg_pid": None, "stopped_at": datetime.now(timezone.utc)}}
     )
-    return {"message": "Stream stopped"}
+    return {"message": "Stream stopped", "stream_id": stream.get("stream_id")}
 
 # ==================== DASHBOARD STATS ====================
 
@@ -1526,10 +1637,12 @@ async def get_dashboard_stats(user: dict = Depends(get_current_user)):
     """Get dashboard statistics"""
     # Count videos
     video_count = await db.videos.count_documents({"user_id": user["user_id"]})
-    
-    # Get live stream status
-    live_stream = await db.live_streams.find_one({"user_id": user["user_id"]})
-    
+
+    # Count active live streams across all slots
+    active_slots = await db.live_streams.count_documents(
+        {"user_id": user["user_id"], "is_live": True}
+    )
+
     # Get recent activity
     recent_videos = await db.videos.find(
         {"user_id": user["user_id"]}
@@ -1544,12 +1657,51 @@ async def get_dashboard_stats(user: dict = Depends(get_current_user)):
         })
     
     return {
-        "active_live_slots": 1 if live_stream and live_stream.get("is_live") else 0,
+        "active_live_slots": active_slots,
+        "max_stream_slots": user.get("stream_slots", 1),
         "total_videos": video_count,
         "storage_used": user.get("storage_used", 0),
         "plan": user.get("plan"),
         "plan_expires_at": user.get("plan_expires_at").isoformat() if user.get("plan_expires_at") else None,
         "recent_activity": activity
+    }
+
+
+@api_router.get("/health")
+async def health_check():
+    """Public health/version endpoint — no auth. Returns build SHA + timestamp
+    so operators can verify a `git pull` + `deploy/update.sh` actually landed."""
+    # Prefer env var if provided by the deploy script; else read git rev-parse.
+    sha = os.environ.get("BUILD_SHA") or ""
+    if not sha:
+        try:
+            import subprocess
+            sha = subprocess.check_output(
+                ["git", "rev-parse", "--short", "HEAD"],
+                cwd=str(ROOT_DIR.parent), stderr=subprocess.DEVNULL, timeout=2
+            ).decode().strip()
+        except Exception:
+            sha = "unknown"
+    # DB ping
+    db_ok = True
+    try:
+        await db.command("ping")
+    except Exception:
+        db_ok = False
+    return {
+        "status": "ok" if db_ok else "degraded",
+        "build_sha": sha,
+        "build_time": os.environ.get("BUILD_TIME", ""),
+        "server_time": datetime.now(timezone.utc).isoformat(),
+        "db": "ok" if db_ok else "down",
+        "features": {
+            "chunked_upload": True,
+            "resumable_upload": True,
+            "video_thumbnails": True,
+            "ffprobe_metadata": True,
+            "multi_slot_streaming": True,
+            "razorpay": True,
+        }
     }
 
 # ==================== STARTUP EVENTS ====================

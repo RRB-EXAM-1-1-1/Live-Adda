@@ -370,9 +370,19 @@ export const youtubeAPI = {
     }
   },
 
-  stopStream: async () => {
+  stopStream: async (streamId) => {
     try {
-      const { data } = await api.post('/stream/stop');
+      const body = streamId ? { stream_id: streamId } : {};
+      const { data } = await api.post('/stream/stop', body);
+      return { data, error: null };
+    } catch (error) {
+      return { data: null, error: formatApiError(error) };
+    }
+  },
+
+  listStreams: async () => {
+    try {
+      const { data } = await api.get('/streams');
       return { data, error: null };
     } catch (error) {
       return { data: null, error: formatApiError(error) };

@@ -251,11 +251,25 @@ const VideoManager = () => {
               {/* Thumbnail */}
               <div className="relative aspect-video bg-gradient-to-br from-gray-900 to-gray-800 flex items-center justify-center overflow-hidden">
                 <VideoThumbnail videoId={video.video_id} title={video.title} />
-                {video.duration && video.duration !== '00:00' && (
-                  <div className="absolute bottom-2 right-2 px-2 py-1 bg-black/80 text-white text-xs rounded">
-                    {video.duration}
-                  </div>
-                )}
+                {/* Duration + Resolution chips */}
+                <div className="absolute bottom-2 right-2 flex gap-1.5">
+                  {video.duration && video.duration !== '00:00' && (
+                    <span
+                      className="px-2 py-0.5 bg-black/80 text-white text-[11px] font-medium rounded"
+                      data-testid={`video-duration-${video.video_id}`}
+                    >
+                      {video.duration}
+                    </span>
+                  )}
+                  {video.height ? (
+                    <span
+                      className="px-2 py-0.5 bg-blue-500/85 text-white text-[11px] font-semibold rounded"
+                      data-testid={`video-resolution-${video.video_id}`}
+                    >
+                      {video.height}p
+                    </span>
+                  ) : null}
+                </div>
               </div>
 
               {/* Info */}
