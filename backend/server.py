@@ -292,9 +292,93 @@ async def sync_user_plans_and_enforce_slots(user: dict) -> dict:
                 }}
             )
             logger.info(f"Stopped excess stream {s.get('stream_id')} for user {user['user_id']} — slot count shrank to {max_slots}")
+            # Auto-delete the video attached to this just-stopped stream
+            # (guards against another live slot still using the same video_id).
+            await cleanup_stream_video_if_orphaned(user["user_id"], s.get("video_id"))
 
     refreshed = await db.users.find_one({"user_id": user["user_id"]}, {"_id": 0, "password_hash": 0})
     return refreshed or user
+
+
+async def _delete_video_files_and_row(user_id: str, video_id: str) -> int:
+    """Delete a single video's file + thumbnail + Mongo row AND refund the
+    user's storage_used counter by the video's byte size. Returns the number
+    of bytes freed (0 if the video didn't exist)."""
+    if not video_id:
+        return 0
+    video = await db.videos.find_one({"user_id": user_id, "video_id": video_id})
+    if not video:
+        return 0
+    freed = int(video.get("size", 0) or 0)
+    # Delete the main file
+    file_path = video.get("file_path")
+    if file_path:
+        try:
+            Path(file_path).unlink(missing_ok=True)
+        except Exception as e:
+            logger.warning(f"Failed to delete video file {file_path}: {e}")
+    # Delete the JPEG thumbnail if it exists
+    try:
+        (UPLOAD_DIR / "thumbnails" / f"{video_id}.jpg").unlink(missing_ok=True)
+    except Exception:
+        pass
+    # Refund storage_used (guard against going negative)
+    await db.users.update_one(
+        {"user_id": user_id},
+        {"$inc": {"storage_used": -freed}}
+    )
+    await db.users.update_one(
+        {"user_id": user_id, "storage_used": {"$lt": 0}},
+        {"$set": {"storage_used": 0}}
+    )
+    await db.videos.delete_one({"video_id": video_id, "user_id": user_id})
+    logger.info(f"Deleted video {video_id} for user {user_id} — freed {freed} bytes")
+    return freed
+
+
+async def cleanup_stream_video_if_orphaned(user_id: str, video_id: Optional[str]) -> None:
+    """Delete the video associated with a just-stopped stream, but ONLY if no
+    OTHER live stream on the same account still references it (so we don't
+    yank a video out from under another active slot)."""
+    if not video_id:
+        return
+    still_used = await db.live_streams.count_documents({
+        "user_id": user_id, "is_live": True, "video_id": video_id
+    })
+    if still_used > 0:
+        logger.info(f"Video {video_id} still used by {still_used} other live stream(s) — skipping delete")
+        return
+    await _delete_video_files_and_row(user_id, video_id)
+
+
+async def wipe_all_videos_for_user(user_id: str) -> int:
+    """Delete every video (file + row) belonging to a user and reset the
+    storage counter. Called when every plan on the account has expired so the
+    server's disk isn't held hostage by users who've stopped paying.
+    Returns count of videos deleted."""
+    count = 0
+    async for v in db.videos.find({"user_id": user_id}):
+        vid_id = v.get("video_id")
+        if not vid_id:
+            continue
+        # Best-effort file cleanup
+        fp = v.get("file_path")
+        if fp:
+            try: Path(fp).unlink(missing_ok=True)
+            except Exception: pass
+        try:
+            (UPLOAD_DIR / "thumbnails" / f"{vid_id}.jpg").unlink(missing_ok=True)
+        except Exception:
+            pass
+        count += 1
+    if count > 0:
+        await db.videos.delete_many({"user_id": user_id})
+        await db.users.update_one(
+            {"user_id": user_id},
+            {"$set": {"storage_used": 0}}
+        )
+        logger.info(f"Wiped {count} videos for user {user_id} (all plans expired)")
+    return count
 
 
 async def activate_or_extend_plan(user_id: str, plan_id: str) -> dict:
@@ -351,6 +435,27 @@ async def check_active_plan(user: dict):
             {"user_id": user["user_id"]},
             {"$set": {"active_plans": [], "plan": None, "plan_expires_at": None, "stream_slots": 0}}
         )
+        # Auto-cleanup: stop any lingering ffmpeg process, delete their videos.
+        # Runs at most once per user (subsequent calls find no videos to wipe).
+        try:
+            async for s in db.live_streams.find({"user_id": user["user_id"], "is_live": True}):
+                if s.get("ffmpeg_pid"):
+                    try:
+                        youtube_service.stop_ffmpeg_push(s["ffmpeg_pid"])
+                    except Exception:
+                        pass
+                await db.live_streams.update_one(
+                    {"_id": s["_id"]},
+                    {"$set": {
+                        "is_live": False,
+                        "ffmpeg_pid": None,
+                        "stopped_at": datetime.now(timezone.utc),
+                        "stopped_reason": "all_plans_expired",
+                    }}
+                )
+            await wipe_all_videos_for_user(user["user_id"])
+        except Exception as e:
+            logger.warning(f"Cleanup after plan expiry failed for user {user['user_id']}: {e}")
         raise HTTPException(
             status_code=403,
             detail="⚠️ Please purchase a slot/plan first to proceed."
@@ -1768,9 +1873,14 @@ async def stop_stream_with_key(
 
     await db.live_streams.update_one(
         {"_id": stream["_id"]},
-        {"$set": {"is_live": False, "ffmpeg_pid": None, "stopped_at": datetime.now(timezone.utc)}}
+        {"$set": {"is_live": False, "ffmpeg_pid": None, "stopped_at": datetime.now(timezone.utc), "stopped_reason": "user_stopped"}}
     )
-    return {"message": "Stream stopped", "stream_id": stream.get("stream_id")}
+    # Auto-delete the video that was being streamed (skips if another live
+    # slot for the same user still references the same video_id).
+    stopped_video_id = stream.get("video_id")
+    if stopped_video_id:
+        await cleanup_stream_video_if_orphaned(user["user_id"], stopped_video_id)
+    return {"message": "Stream stopped", "stream_id": stream.get("stream_id"), "video_deleted": bool(stopped_video_id)}
 
 # ==================== DASHBOARD STATS ====================
 

@@ -18,7 +18,7 @@ import { useNavigate, useSearchParams } from 'react-router-dom';
 import { toast } from 'sonner';
 
 const LiveSlot = () => {
-  const { user } = useAuth();
+  const { user, refreshUser } = useAuth();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const [streamStatus, setStreamStatus] = useState(null);
@@ -51,10 +51,13 @@ const LiveSlot = () => {
   };
 
   const handleStopSpecific = async (streamId) => {
+    if (!window.confirm('Stopping this stream will PERMANENTLY DELETE the video that was being broadcast. Continue?')) return;
     const { data, error } = await youtubeAPI.stopStream(streamId);
     if (data) {
-      toast.success('Stream stopped');
+      toast.success(data.video_deleted ? 'Stream stopped — video removed from storage' : 'Stream stopped');
       await loadActiveStreams();
+      await loadVideos();
+      if (refreshUser) await refreshUser();
     } else {
       toast.error(error || 'Failed to stop stream');
     }
@@ -89,13 +92,17 @@ const LiveSlot = () => {
   };
 
   const handleStopKeyStream = async () => {
+    if (!window.confirm('Stopping this stream will PERMANENTLY DELETE the video that was being broadcast. Continue?')) return;
     setKeyLoading(true);
     const { data, error } = await youtubeAPI.stopStream();
     setKeyLoading(false);
     if (data) {
       setIsLive(false);
-      toast.success('Stream stopped');
+      toast.success(data.video_deleted ? 'Stream stopped — video removed from storage' : 'Stream stopped');
       loadStreamStatus();
+      loadVideos();
+      loadActiveStreams();
+      if (refreshUser) refreshUser();
     } else {
       toast.error(error || 'Failed to stop stream');
     }

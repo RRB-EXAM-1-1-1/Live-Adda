@@ -135,3 +135,24 @@ Build "Live Adda" - a professional 24/7 YouTube Live streaming SaaS platform.
 - FRONTEND Billings: NEW `active-plans-panel` section showing one card per active plan with days-until-expiry + a "N concurrent stream slots unlocked" badge. Plan card feature list changed from "1 Active Live Slot" to "+1 Live Streaming Slot" to communicate stacking. Hidden for admin (no active_plans) and users with no plans.
 - TESTING (iteration_10.json): 14/14 new pytest tests pass — activate/extend, expiry pruning + excess-stream stopping, check_active_plan expired/lifetime, /auth/me shape, /streams + /dashboard/stats max_slots, /start-with-key slot enforcement (3rd attempt for 2-slot user = 403), same-plan stack idempotency, legacy startup migration for both future+past plans. iter-9 regression (/api/health, stream_id backfill) still green. Frontend E2E on fresh 2-plan user verified all data-testids.
 
+
+## Iteration 11 (2026-08-01) - Auto Video Cleanup on Stream Stop / Plan Expiry
+- USER REQUEST: When a stream stops (user action OR plan expiry auto-stop), the video that was being broadcast must be permanently deleted. When ALL a user's plans expire, wipe every video in their account.
+- NEW BACKEND HELPERS (`server.py`):
+  - `_delete_video_files_and_row(user_id, video_id)` — removes file + thumbnail + Mongo row, refunds storage_used (clamped ≥0)
+  - `cleanup_stream_video_if_orphaned(user_id, video_id)` — deletes ONLY if no other live stream on the account references the same video_id (prevents yanking a video from another live slot)
+  - `wipe_all_videos_for_user(user_id)` — nukes everything + resets storage_used=0 (called when all plans have expired so the droplet's disk isn't held hostage)
+- WIRED INTO:
+  - `POST /api/stream/stop` — after marking is_live=False, calls `cleanup_stream_video_if_orphaned`. Response now includes `video_deleted: true/false`. Sets `stopped_reason='user_stopped'`.
+  - `sync_user_plans_and_enforce_slots` — after auto-stopping excess streams from slot-shrink, calls the same cleanup per stream. Preserves the `stopped_reason='plan_expired_slot_shrink'` label.
+  - `check_active_plan` (all-plans-expired branch) — first stops any lingering ffmpeg + marks live_streams `stopped_reason='all_plans_expired'`, THEN calls `wipe_all_videos_for_user`, THEN raises 403.
+- FRONTEND UX (`LiveSlot.jsx`):
+  - Both stop buttons (per-slot Stop + primary "Stop Live Stream") now show a confirm() dialog: "Stopping this stream will PERMANENTLY DELETE the video that was being broadcast."
+  - On success, toast shows either "Stream stopped — video removed from storage" or plain "Stream stopped" (based on backend's `video_deleted` field)
+  - After stop, refreshes videos list + user's storage_used counter so the UI reflects the freed space instantly
+- TESTING (manual direct-call, 4/4 pass):
+  - T1 stop stream → file removed, DB row gone, storage_used refunded exactly
+  - T2 orphan check → 2 live slots share same video, stopping one preserves the file; stopping the second finally deletes it
+  - T3 wipe_all_videos_for_user → 3 videos + files removed, storage=0
+  - T4 check_active_plan on all-expired user → stops zombie stream (stopped_reason='all_plans_expired'), wipes videos, raises 403
+
