@@ -28,6 +28,9 @@ import hmac
 import hashlib
 import youtube_service
 
+# Build SHA is resolved once at first request and cached
+_BUILD_SHA_CACHE = None
+
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
@@ -1671,17 +1674,19 @@ async def get_dashboard_stats(user: dict = Depends(get_current_user)):
 async def health_check():
     """Public health/version endpoint — no auth. Returns build SHA + timestamp
     so operators can verify a `git pull` + `deploy/update.sh` actually landed."""
-    # Prefer env var if provided by the deploy script; else read git rev-parse.
-    sha = os.environ.get("BUILD_SHA") or ""
-    if not sha:
-        try:
-            import subprocess
-            sha = subprocess.check_output(
-                ["git", "rev-parse", "--short", "HEAD"],
-                cwd=str(ROOT_DIR.parent), stderr=subprocess.DEVNULL, timeout=2
-            ).decode().strip()
-        except Exception:
-            sha = "unknown"
+    global _BUILD_SHA_CACHE
+    if _BUILD_SHA_CACHE is None:
+        sha = os.environ.get("BUILD_SHA") or ""
+        if not sha:
+            try:
+                import subprocess
+                sha = subprocess.check_output(
+                    ["git", "rev-parse", "--short", "HEAD"],
+                    cwd=str(ROOT_DIR.parent), stderr=subprocess.DEVNULL, timeout=2
+                ).decode().strip()
+            except Exception:
+                sha = "unknown"
+        _BUILD_SHA_CACHE = sha or "unknown"
     # DB ping
     db_ok = True
     try:
@@ -1690,7 +1695,7 @@ async def health_check():
         db_ok = False
     return {
         "status": "ok" if db_ok else "degraded",
-        "build_sha": sha,
+        "build_sha": _BUILD_SHA_CACHE,
         "build_time": os.environ.get("BUILD_TIME", ""),
         "server_time": datetime.now(timezone.utc).isoformat(),
         "db": "ok" if db_ok else "down",
@@ -1713,6 +1718,8 @@ async def startup_event():
     await db.users.create_index("email", unique=True)
     await db.users.create_index("user_id", unique=True)
     await db.videos.create_index("user_id")
+    # Speeds up multi-slot count/list queries.
+    await db.live_streams.create_index("user_id")
     # Idempotency key for chunked uploads. Partial filter ensures only new
     # rows (with a string upload_id) are indexed — legacy rows without
     # upload_id are excluded. Prevents duplicate video docs on retried

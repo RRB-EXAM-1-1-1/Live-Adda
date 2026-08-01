@@ -27,6 +27,21 @@ fi
 echo "==> [1/5] Pulling latest code..."
 git pull
 
+# Capture the deployed commit SHA so /api/health can report it without needing git at runtime
+DEPLOYED_SHA=$(git -C "$INSTALL_DIR" rev-parse --short HEAD 2>/dev/null || echo "unknown")
+DEPLOYED_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+if grep -q "^BUILD_SHA=" "$INSTALL_DIR/backend/.env" 2>/dev/null; then
+  sed -i "s|^BUILD_SHA=.*|BUILD_SHA=\"${DEPLOYED_SHA}\"|" "$INSTALL_DIR/backend/.env"
+else
+  echo "BUILD_SHA=\"${DEPLOYED_SHA}\"" >> "$INSTALL_DIR/backend/.env"
+fi
+if grep -q "^BUILD_TIME=" "$INSTALL_DIR/backend/.env" 2>/dev/null; then
+  sed -i "s|^BUILD_TIME=.*|BUILD_TIME=\"${DEPLOYED_TIME}\"|" "$INSTALL_DIR/backend/.env"
+else
+  echo "BUILD_TIME=\"${DEPLOYED_TIME}\"" >> "$INSTALL_DIR/backend/.env"
+fi
+echo "    Deployed SHA=${DEPLOYED_SHA}  time=${DEPLOYED_TIME}"
+
 echo "==> [2/5] Backend deps + restart..."
 cd "$INSTALL_DIR/backend"
 source venv/bin/activate
