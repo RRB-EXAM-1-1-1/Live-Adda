@@ -336,7 +336,7 @@ class TestIdempotentActivation:
             return first, second
 
         try:
-            first, second = asyncio.run(run())
+            first, second = _arun(run())
             assert first is True, "First activation should activate"
             assert second is False, "Second activation must be a no-op"
             user = db.users.find_one({"user_id": user_id})
@@ -351,7 +351,7 @@ class TestIdempotentActivation:
     def test_activate_plan_not_paid_no_op(self):
         import asyncio
         from server import activate_plan_from_transaction
-        result = asyncio.run(activate_plan_from_transaction("cs_unknown_session", "unpaid"))
+        result = _arun(activate_plan_from_transaction("cs_unknown_session", "unpaid"))
         assert result is False
 
 
@@ -2043,3 +2043,423 @@ class TestIter9GSCFile:
         assert 'name="google-site-verification"' in r.text
         assert 'content="google217b552950b617e1"' in r.text
         assert "REPLACE_WITH_YOUR_GSC_TOKEN" not in r.text
+
+
+
+# ==================== ITERATION 10: Slot Stacking ====================
+
+# Shared persistent asyncio loop for direct-call tests. Motor binds its client to
+# the first loop that touches it — using a single loop across all direct-call
+# tests avoids "Event loop is closed" errors from _arun() spinning up new loops.
+import asyncio as _asyncio_iter10
+_ITER10_LOOP = _asyncio_iter10.new_event_loop()
+
+def _arun(coro):
+    return _ITER10_LOOP.run_until_complete(coro)
+
+
+def _make_fresh_user_direct(name_suffix=""):
+    """Register a fresh user via /api/auth/register and return (session, email, user_id)."""
+    s = requests.Session()
+    email = f"TEST_iter10_{uuid.uuid4().hex[:8]}{name_suffix}@example.com"
+    r = s.post(f"{API}/auth/register", json={
+        "email": email, "password": "pw123456", "name": "Iter10 Tester"
+    }, timeout=30)
+    assert r.status_code == 200, r.text
+    return s, email, r.json()["user_id"]
+
+
+class TestIter10ActivateOrExtendPlan:
+    """Direct-call tests of server.activate_or_extend_plan()."""
+
+    def test_stack_daily_weekly_daily_monthly(self):
+        import asyncio
+        import sys
+        sys.path.insert(0, "/app/backend")
+        from server import activate_or_extend_plan, db as server_db
+        s, email, uid = _make_fresh_user_direct("_stack")
+        static_db = _get_mongo_db_static()
+        try:
+            # 1) daily
+            u = _arun(activate_or_extend_plan(uid, "daily"))
+            assert u["stream_slots"] == 1, u
+            assert len(u["active_plans"]) == 1
+            assert u["active_plans"][0]["plan_id"] == "daily"
+            daily_exp_1 = u["active_plans"][0]["expires_at"]
+
+            # 2) weekly => 2 slots, 2 entries
+            u = _arun(activate_or_extend_plan(uid, "weekly"))
+            assert u["stream_slots"] == 2, u
+            plan_ids = sorted([e["plan_id"] for e in u["active_plans"]])
+            assert plan_ids == ["daily", "weekly"], plan_ids
+
+            # 3) daily AGAIN — no new slot, but daily entry's expires_at extended by 1 day
+            u = _arun(activate_or_extend_plan(uid, "daily"))
+            assert u["stream_slots"] == 2, u
+            assert len(u["active_plans"]) == 2
+            daily_entry = next(e for e in u["active_plans"] if e["plan_id"] == "daily")
+            new_daily_exp = daily_entry["expires_at"]
+            # New expiry should be ~1 day further out than the original
+            from datetime import timedelta
+            def _to_dt(x):
+                from datetime import datetime
+                if isinstance(x, str):
+                    return datetime.fromisoformat(x.replace("Z", "+00:00"))
+                return x
+            delta = _to_dt(new_daily_exp) - _to_dt(daily_exp_1)
+            assert timedelta(hours=23) < delta < timedelta(hours=25), f"Expected ~1 day extension, got {delta}"
+
+            # 4) monthly => 3 slots, 3 entries
+            u = _arun(activate_or_extend_plan(uid, "monthly"))
+            assert u["stream_slots"] == 3, u
+            assert len(u["active_plans"]) == 3
+            plan_ids = sorted([e["plan_id"] for e in u["active_plans"]])
+            assert plan_ids == ["daily", "monthly", "weekly"]
+        finally:
+            static_db.users.delete_one({"user_id": uid})
+            static_db.live_streams.delete_many({"user_id": uid})
+
+
+class TestIter10ExpiryPruning:
+    """sync_user_plans_and_enforce_slots prunes expired entries and stops excess ffmpeg streams."""
+
+    def test_prune_and_shrink_slots(self):
+        import asyncio, sys
+        sys.path.insert(0, "/app/backend")
+        from server import activate_or_extend_plan, sync_user_plans_and_enforce_slots, db as server_db
+        from datetime import datetime, timezone, timedelta
+
+        s, email, uid = _make_fresh_user_direct("_prune")
+        static_db = _get_mongo_db_static()
+        try:
+            # Give the user daily + weekly (2 slots)
+            _arun(activate_or_extend_plan(uid, "daily"))
+            _arun(activate_or_extend_plan(uid, "weekly"))
+
+            # Seed 2 live streams
+            now = datetime.now(timezone.utc)
+            for i, k in enumerate(["KEY-P1", "KEY-P2"]):
+                static_db.live_streams.insert_one({
+                    "stream_id": f"seed_prune_{i}_{uuid.uuid4().hex[:6]}",
+                    "user_id": uid, "is_live": True, "stream_key": k,
+                    "ffmpeg_pid": None,
+                    "started_at": now + timedelta(seconds=i),  # newest = i=1
+                    "current_video": "seeded", "video_id": "seedvid",
+                    "stream_method": "manual_key",
+                })
+
+            # Push the daily entry's expires_at into the past
+            user_doc = static_db.users.find_one({"user_id": uid})
+            active = list(user_doc.get("active_plans") or [])
+            for e in active:
+                if e["plan_id"] == "daily":
+                    e["expires_at"] = datetime(2020, 1, 1, tzinfo=timezone.utc)
+            static_db.users.update_one({"user_id": uid}, {"$set": {"active_plans": active}})
+
+            # Sync — must prune daily, decrement slots to 1, stop the newest excess stream
+            user_doc = static_db.users.find_one({"user_id": uid})
+            _arun(sync_user_plans_and_enforce_slots(user_doc))
+
+            refreshed = static_db.users.find_one({"user_id": uid})
+            assert len(refreshed["active_plans"]) == 1, refreshed["active_plans"]
+            assert refreshed["active_plans"][0]["plan_id"] == "weekly"
+            assert refreshed["stream_slots"] == 1
+
+            # Excess (newest) stream should be stopped with plan_expired_slot_shrink
+            stopped = list(static_db.live_streams.find({"user_id": uid, "is_live": False}))
+            assert len(stopped) == 1, f"Expected 1 stopped stream, got {len(stopped)}"
+            assert stopped[0].get("stopped_reason") == "plan_expired_slot_shrink"
+
+            # 1 stream should remain live
+            still_live = list(static_db.live_streams.find({"user_id": uid, "is_live": True}))
+            assert len(still_live) == 1
+        finally:
+            static_db.users.delete_one({"user_id": uid})
+            static_db.live_streams.delete_many({"user_id": uid})
+
+
+class TestIter10CheckActivePlan:
+    """check_active_plan integration — raises 403 only when NO live entries; never for lifetime."""
+
+    def test_non_expired_entry_passes(self):
+        import asyncio, sys
+        sys.path.insert(0, "/app/backend")
+        from server import activate_or_extend_plan, check_active_plan
+        from fastapi import HTTPException
+        s, email, uid = _make_fresh_user_direct("_chkok")
+        db = _get_mongo_db_static()
+        try:
+            _arun(activate_or_extend_plan(uid, "daily"))
+            user = db.users.find_one({"user_id": uid})
+            # Should not raise
+            _arun(check_active_plan(user))
+        finally:
+            db.users.delete_one({"user_id": uid})
+
+    def test_only_expired_entries_raises_403_and_clears(self):
+        import asyncio, sys
+        sys.path.insert(0, "/app/backend")
+        from server import check_active_plan
+        from fastapi import HTTPException
+        from datetime import datetime, timezone
+        s, email, uid = _make_fresh_user_direct("_chkexp")
+        db = _get_mongo_db_static()
+        try:
+            db.users.update_one({"user_id": uid}, {"$set": {
+                "plan": "daily",
+                "plan_expires_at": datetime(2020, 1, 1, tzinfo=timezone.utc),
+                "active_plans": [{
+                    "plan_id": "daily",
+                    "purchased_at": datetime(2019, 12, 30, tzinfo=timezone.utc),
+                    "expires_at": datetime(2020, 1, 1, tzinfo=timezone.utc),
+                }],
+                "stream_slots": 1,
+            }})
+            user = db.users.find_one({"user_id": uid})
+            raised = False
+            try:
+                _arun(check_active_plan(user))
+            except HTTPException as ex:
+                raised = True
+                assert ex.status_code == 403
+            assert raised, "Expected HTTPException 403 for only-expired entries"
+            # Doc must be cleared
+            refreshed = db.users.find_one({"user_id": uid})
+            assert refreshed["active_plans"] == []
+            assert refreshed["plan"] is None
+            assert refreshed["plan_expires_at"] is None
+            assert refreshed["stream_slots"] == 0
+        finally:
+            db.users.delete_one({"user_id": uid})
+
+    def test_lifetime_never_raises(self):
+        import asyncio, sys
+        sys.path.insert(0, "/app/backend")
+        from server import check_active_plan
+        db = _get_mongo_db_static()
+        admin = db.users.find_one({"email": ADMIN_EMAIL})
+        assert admin and admin.get("plan") == "lifetime"
+        # Should not raise even though active_plans might be empty
+        _arun(check_active_plan(admin))
+
+
+class TestIter10AuthMeShape:
+    """/api/auth/me returns active_plans as ISO strings + computed stream_slots."""
+
+    def test_admin_shape(self, admin_session):
+        r = admin_session.get(f"{API}/auth/me", timeout=15)
+        assert r.status_code == 200
+        d = r.json()
+        assert isinstance(d.get("active_plans"), list)
+        assert d.get("stream_slots") == 3, d
+        assert d.get("plan") == "lifetime"
+
+    def test_fresh_user_with_2_plans(self):
+        import asyncio, sys
+        sys.path.insert(0, "/app/backend")
+        from server import activate_or_extend_plan
+        s, email, uid = _make_fresh_user_direct("_me2")
+        db = _get_mongo_db_static()
+        try:
+            _arun(activate_or_extend_plan(uid, "daily"))
+            _arun(activate_or_extend_plan(uid, "weekly"))
+            r = s.get(f"{API}/auth/me", timeout=15)
+            assert r.status_code == 200
+            d = r.json()
+            assert d["stream_slots"] == 2, d
+            assert len(d["active_plans"]) == 2
+            for e in d["active_plans"]:
+                assert e["plan_id"] in ("daily", "weekly")
+                # Must be ISO strings
+                assert isinstance(e["purchased_at"], str) and "T" in e["purchased_at"]
+                assert isinstance(e["expires_at"], str) and "T" in e["expires_at"]
+        finally:
+            db.users.delete_one({"user_id": uid})
+
+
+class TestIter10StreamsAndStatsMaxSlots:
+    """/api/streams max_slots + /api/dashboard/stats max_stream_slots both use compute_stream_slots."""
+
+    def test_admin_max_slots_3(self, admin_session):
+        r1 = admin_session.get(f"{API}/streams", timeout=15).json()
+        r2 = admin_session.get(f"{API}/dashboard/stats", timeout=15).json()
+        assert r1["max_slots"] == 3, r1
+        assert r2["max_stream_slots"] == 3, r2
+
+    def test_fresh_user_daily_weekly_max_slots_2(self):
+        import asyncio, sys
+        sys.path.insert(0, "/app/backend")
+        from server import activate_or_extend_plan
+        s, email, uid = _make_fresh_user_direct("_maxslots")
+        db = _get_mongo_db_static()
+        try:
+            _arun(activate_or_extend_plan(uid, "daily"))
+            _arun(activate_or_extend_plan(uid, "weekly"))
+            r1 = s.get(f"{API}/streams", timeout=15).json()
+            r2 = s.get(f"{API}/dashboard/stats", timeout=15).json()
+            assert r1["max_slots"] == 2, r1
+            assert r2["max_stream_slots"] == 2, r2
+        finally:
+            db.users.delete_one({"user_id": uid})
+
+
+class TestIter10StartWithKeySlotEnforcement:
+    """Fresh user with 2 plans (Daily+Weekly) can seed 2 live streams; 3rd rejected 403."""
+
+    def test_third_stream_blocked_at_2_slots(self):
+        import asyncio, sys
+        sys.path.insert(0, "/app/backend")
+        from server import activate_or_extend_plan
+        from datetime import datetime, timezone
+        s, email, uid = _make_fresh_user_direct("_start3")
+        db = _get_mongo_db_static()
+        try:
+            _arun(activate_or_extend_plan(uid, "daily"))
+            _arun(activate_or_extend_plan(uid, "weekly"))
+
+            # Seed a video so /api/stream/start-with-key passes video ownership check
+            db.videos.insert_one({
+                "video_id": "seed_vid_i10",
+                "user_id": uid,
+                "title": "Seeded",
+                "file_path": "/tmp/nonexistent.mp4",
+                "size": 1024,
+                "duration_seconds": 5,
+                "created_at": datetime.now(timezone.utc),
+            })
+
+            # Seed 2 already-live streams — fills the 2 slots
+            for i, k in enumerate(["KEY-S1", "KEY-S2"]):
+                db.live_streams.insert_one({
+                    "stream_id": f"seed_s_{i}_{uuid.uuid4().hex[:6]}",
+                    "user_id": uid, "is_live": True, "stream_key": k,
+                    "ffmpeg_pid": None,
+                    "started_at": datetime.now(timezone.utc),
+                    "current_video": "seeded", "video_id": "seed_vid_i10",
+                    "stream_method": "manual_key",
+                })
+
+            # 3rd attempt via API should be blocked BEFORE ffmpeg spawn
+            r = s.post(f"{API}/stream/start-with-key", json={
+                "stream_key": "KEY-S3-NEW", "video_id": "seed_vid_i10", "loop": False,
+            }, timeout=15)
+            assert r.status_code == 403, f"expected 403, got {r.status_code}: {r.text[:200]}"
+            assert "maximum of 2" in r.text, r.text
+        finally:
+            db.users.delete_one({"user_id": uid})
+            db.videos.delete_many({"user_id": uid})
+            db.live_streams.delete_many({"user_id": uid})
+
+
+class TestIter10RazorpayVerifyStacksSamePlan:
+    """activate_or_extend_plan is idempotent for the same plan (stacks duration, no new slot)."""
+
+    def test_same_plan_stacks_duration_only(self):
+        import asyncio, sys
+        sys.path.insert(0, "/app/backend")
+        from server import activate_or_extend_plan
+        s, email, uid = _make_fresh_user_direct("_samestack")
+        db = _get_mongo_db_static()
+        try:
+            u1 = _arun(activate_or_extend_plan(uid, "weekly"))
+            first_exp = u1["active_plans"][0]["expires_at"]
+            u2 = _arun(activate_or_extend_plan(uid, "weekly"))
+            assert u2["stream_slots"] == 1, u2
+            assert len(u2["active_plans"]) == 1
+            second_exp = u2["active_plans"][0]["expires_at"]
+
+            from datetime import datetime, timedelta
+            def _dt(x):
+                return datetime.fromisoformat(x.replace("Z", "+00:00")) if isinstance(x, str) else x
+            delta = _dt(second_exp) - _dt(first_exp)
+            assert timedelta(days=6, hours=23) < delta < timedelta(days=7, hours=1), f"delta={delta}"
+        finally:
+            db.users.delete_one({"user_id": uid})
+
+
+class TestIter10LegacyMigration:
+    """Startup migration converts legacy plan+plan_expires_at users into active_plans."""
+
+    def test_legacy_future_plan_migrated_on_startup(self):
+        """Insert a legacy user (no active_plans) with future plan_expires_at, restart backend,
+        verify migration populated active_plans + stream_slots=1."""
+        import subprocess, time
+        from datetime import datetime, timezone, timedelta
+        db = _get_mongo_db_static()
+        uid_future = f"legacy_future_{uuid.uuid4().hex[:8]}"
+        uid_past = f"legacy_past_{uuid.uuid4().hex[:8]}"
+        future_exp = datetime.now(timezone.utc) + timedelta(days=5)
+        past_exp = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        try:
+            # Legacy: future plan
+            db.users.insert_one({
+                "user_id": uid_future,
+                "email": f"TEST_legacy_fut_{uuid.uuid4().hex[:6]}@example.com",
+                "name": "Legacy Future",
+                "password_hash": "$2b$12$dummydummydummydummydummydummydummydummydummydummy",
+                "plan": "monthly",
+                "plan_expires_at": future_exp,
+                "storage_used": 0,
+                "role": "user",
+                "stream_slots": 1,
+                "created_at": datetime.now(timezone.utc),
+            })
+            # Legacy: past plan
+            db.users.insert_one({
+                "user_id": uid_past,
+                "email": f"TEST_legacy_past_{uuid.uuid4().hex[:6]}@example.com",
+                "name": "Legacy Past",
+                "password_hash": "$2b$12$dummydummydummydummydummydummydummydummydummydummy",
+                "plan": "daily",
+                "plan_expires_at": past_exp,
+                "storage_used": 0,
+                "role": "user",
+                "stream_slots": 1,
+                "created_at": datetime.now(timezone.utc),
+            })
+            # Restart backend to trigger startup_event migration
+            subprocess.check_output(["sudo", "supervisorctl", "restart", "backend"], timeout=30)
+            # Wait for backend to come back up
+            for _ in range(30):
+                time.sleep(1)
+                try:
+                    h = requests.get(f"{API}/health", timeout=3)
+                    if h.status_code == 200:
+                        break
+                except Exception:
+                    continue
+            else:
+                pytest.fail("Backend did not come back after restart")
+
+            # Verify future legacy user was migrated
+            u_fut = db.users.find_one({"user_id": uid_future})
+            assert isinstance(u_fut.get("active_plans"), list), u_fut
+            assert len(u_fut["active_plans"]) == 1, u_fut["active_plans"]
+            assert u_fut["active_plans"][0]["plan_id"] == "monthly"
+            assert u_fut.get("stream_slots") == 1
+
+            # Verify past legacy user was cleared
+            u_past = db.users.find_one({"user_id": uid_past})
+            assert u_past.get("active_plans") == [], u_past
+            assert u_past.get("plan") is None
+            assert u_past.get("plan_expires_at") is None
+            assert u_past.get("stream_slots") == 0
+        finally:
+            db.users.delete_one({"user_id": uid_future})
+            db.users.delete_one({"user_id": uid_past})
+
+
+class TestIter10Regression:
+    """Regression: iter-9 features still work — stream_id present on all rows, /api/health OK."""
+
+    def test_health_still_ok(self):
+        r = requests.get(f"{API}/health", timeout=10)
+        assert r.status_code == 200
+        assert r.json().get("status") == "ok"
+
+    def test_streams_list_has_stream_id_for_admin(self, admin_session):
+        r = admin_session.get(f"{API}/streams", timeout=15)
+        assert r.status_code == 200
+        d = r.json()
+        for s in d.get("active", []):
+            assert s.get("stream_id"), s

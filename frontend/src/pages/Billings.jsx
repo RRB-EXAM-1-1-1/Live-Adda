@@ -13,7 +13,7 @@ const PLANS = [
     price: 35,
     duration: '24 Hours',
     badge: null,
-    features: ['1 Active Live Slot', '24/7 Continuous Stream', '2GB Video Storage', 'Standard Support']
+    features: ['+1 Live Streaming Slot', '24/7 Continuous Stream', '2GB Video Storage', 'Standard Support']
   },
   {
     id: 'weekly',
@@ -21,7 +21,7 @@ const PLANS = [
     price: 199,
     duration: '7 Days',
     badge: 'Popular',
-    features: ['1 Active Live Slot', '24/7 Continuous Stream', '2GB Video Storage', 'Priority Support']
+    features: ['+1 Live Streaming Slot', '24/7 Continuous Stream', '2GB Video Storage', 'Priority Support']
   },
   {
     id: 'monthly',
@@ -29,9 +29,11 @@ const PLANS = [
     price: 599,
     duration: '30 Days',
     badge: 'Best Value',
-    features: ['1 Active Live Slot', '24/7 Continuous Stream', '2GB Video Storage', 'Priority Support', 'Advanced Analytics']
+    features: ['+1 Live Streaming Slot', '24/7 Continuous Stream', '2GB Video Storage', 'Priority Support', 'Advanced Analytics']
   }
 ];
+
+const PLAN_LABEL = { daily: 'Daily', weekly: 'Weekly', monthly: 'Monthly', lifetime: 'Lifetime' };
 
 const Billings = () => {
   const navigate = useNavigate();
@@ -138,6 +140,51 @@ const Billings = () => {
         <h1 className="text-3xl font-bold text-white mb-2">Billings & Plans</h1>
         <p className="text-gray-400">Manage your subscription and billing information</p>
       </div>
+
+      {/* Active Plans & Slots (slot-stacking) */}
+      {user?.active_plans && user.active_plans.length > 0 && (
+        <div
+          className="bg-gray-800/60 backdrop-blur-lg rounded-2xl p-6 border border-emerald-500/20"
+          data-testid="active-plans-panel"
+        >
+          <div className="flex items-center justify-between flex-wrap gap-3 mb-4">
+            <h2 className="text-xl font-bold text-white flex items-center">
+              <CheckCircle className="w-5 h-5 mr-2 text-emerald-400" />
+              Your Active Plans
+            </h2>
+            <div
+              data-testid="total-slots-badge"
+              className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-emerald-500/15 border border-emerald-500/30"
+            >
+              <span className="text-emerald-300 font-semibold text-sm">
+                {user.stream_slots} concurrent stream slot{user.stream_slots !== 1 ? 's' : ''} unlocked
+              </span>
+            </div>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+            {user.active_plans.map((p, i) => {
+              const exp = new Date(p.expires_at);
+              const days = Math.max(0, Math.ceil((exp - new Date()) / (1000 * 60 * 60 * 24)));
+              return (
+                <div
+                  key={`${p.plan_id}-${i}`}
+                  data-testid={`active-plan-${p.plan_id}`}
+                  className="bg-gray-900/50 rounded-xl p-4 border border-gray-700"
+                >
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="text-white font-semibold">{PLAN_LABEL[p.plan_id] || p.plan_id}</span>
+                    <span className="text-emerald-400 text-xs font-semibold">+1 slot</span>
+                  </div>
+                  <p className="text-gray-400 text-xs">Expires in {days} day{days !== 1 ? 's' : ''} · {exp.toLocaleDateString()}</p>
+                </div>
+              );
+            })}
+          </div>
+          <p className="text-gray-500 text-xs mt-4">
+            💡 Buy a <b>different</b> plan to unlock another concurrent stream slot. Re-buying the same plan simply extends its duration.
+          </p>
+        </div>
+      )}
 
       {/* Current Plan */}
       {hasActivePlan ? (

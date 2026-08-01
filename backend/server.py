@@ -176,35 +176,185 @@ async def get_current_user(request: Request) -> dict:
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
+# ==================== SLOT STACKING (Active Plans) ====================
+#
+# Each user has an `active_plans` array holding one entry PER non-expired plan.
+# Every entry = +1 stream slot. Buying the same plan again extends that entry's
+# expires_at (stacks duration, no new slot). Buying a different plan appends a
+# NEW entry (adds a slot). Admin `lifetime` overrides everything to 3 slots.
+#
+# Entry shape: {"plan_id": str, "purchased_at": datetime, "expires_at": datetime}
+
+
+def _as_utc(dt) -> Optional[datetime]:
+    """Normalize a stored datetime (may be str or naive) to a tz-aware UTC datetime."""
+    if not dt:
+        return None
+    if isinstance(dt, str):
+        try:
+            dt = datetime.fromisoformat(dt.replace("Z", "+00:00"))
+        except Exception:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _active_entries(user: dict) -> List[dict]:
+    """Return the entries in user['active_plans'] whose expires_at > now.
+    Backward compat: if active_plans is missing, synthesize from legacy plan fields."""
+    now = datetime.now(timezone.utc)
+    entries = list(user.get("active_plans") or [])
+    # Legacy migration on the fly: if the user has legacy plan/plan_expires_at but
+    # no active_plans array yet, synthesize a single entry.
+    if not entries and user.get("plan") and user.get("plan_expires_at"):
+        legacy_exp = _as_utc(user.get("plan_expires_at"))
+        if legacy_exp:
+            entries = [{
+                "plan_id": user["plan"],
+                "purchased_at": _as_utc(user.get("plan_started_at")) or now,
+                "expires_at": legacy_exp,
+            }]
+    live = []
+    for e in entries:
+        exp = _as_utc(e.get("expires_at"))
+        if exp and exp > now:
+            live.append({
+                "plan_id": e.get("plan_id"),
+                "purchased_at": _as_utc(e.get("purchased_at")) or now,
+                "expires_at": exp,
+            })
+    return live
+
+
+def compute_stream_slots(user: dict) -> int:
+    """How many concurrent streams this user is allowed to run."""
+    if user.get("plan") == "lifetime":
+        return int(user.get("stream_slots") or 3)
+    live = _active_entries(user)
+    return len(live)
+
+
+async def sync_user_plans_and_enforce_slots(user: dict) -> dict:
+    """Prune expired entries, refresh legacy display fields, and if the user's
+    concurrent-stream count now EXCEEDS their slots, stop the excess ffmpeg
+    processes (most-recent-first) so slot count and running streams stay
+    consistent. Returns the refreshed user doc."""
+    if user.get("plan") == "lifetime":
+        return user
+
+    live = _active_entries(user)
+
+    # Update stored active_plans + legacy display fields
+    if live:
+        # Display "latest expiring" plan as the primary one
+        primary = max(live, key=lambda e: e["expires_at"])
+        legacy_plan = primary["plan_id"]
+        legacy_expiry = primary["expires_at"]
+    else:
+        legacy_plan = None
+        legacy_expiry = None
+
+    await db.users.update_one(
+        {"user_id": user["user_id"]},
+        {"$set": {
+            "active_plans": live,
+            "plan": legacy_plan,
+            "plan_expires_at": legacy_expiry,
+            "stream_slots": (3 if user.get("plan") == "lifetime" else len(live)),
+        }}
+    )
+
+    # Enforce slot budget: if streams > slots, stop the newest excess streams
+    max_slots = len(live)
+    active_streams = await db.live_streams.find(
+        {"user_id": user["user_id"], "is_live": True}
+    ).sort("started_at", -1).to_list(50)
+    if len(active_streams) > max_slots:
+        to_stop = active_streams[: len(active_streams) - max_slots]
+        for s in to_stop:
+            if s.get("ffmpeg_pid"):
+                try:
+                    youtube_service.stop_ffmpeg_push(s["ffmpeg_pid"])
+                except Exception as e:
+                    logger.warning(f"Failed to stop excess ffmpeg pid={s['ffmpeg_pid']}: {e}")
+            await db.live_streams.update_one(
+                {"_id": s["_id"]},
+                {"$set": {
+                    "is_live": False,
+                    "ffmpeg_pid": None,
+                    "stopped_at": datetime.now(timezone.utc),
+                    "stopped_reason": "plan_expired_slot_shrink",
+                }}
+            )
+            logger.info(f"Stopped excess stream {s.get('stream_id')} for user {user['user_id']} — slot count shrank to {max_slots}")
+
+    refreshed = await db.users.find_one({"user_id": user["user_id"]}, {"_id": 0, "password_hash": 0})
+    return refreshed or user
+
+
+async def activate_or_extend_plan(user_id: str, plan_id: str) -> dict:
+    """Idempotently apply a plan purchase to a user's active_plans.
+    - If the user already has a non-expired entry for the same plan_id:
+      EXTEND that entry's expires_at by plan.duration_days (stack).
+    - Otherwise: APPEND a new entry (adds a stream slot).
+    Also updates legacy plan / plan_expires_at fields to the latest-expiring plan.
+    Returns the fresh user doc."""
+    plan = PLANS[plan_id]
+    now = datetime.now(timezone.utc)
+
+    user = await db.users.find_one({"user_id": user_id})
+    live = _active_entries(user or {})
+
+    # Find existing entry for the same plan_id (stack duration)
+    existing = next((e for e in live if e["plan_id"] == plan_id), None)
+    if existing:
+        existing["expires_at"] = existing["expires_at"] + timedelta(days=plan["duration_days"])
+    else:
+        live.append({
+            "plan_id": plan_id,
+            "purchased_at": now,
+            "expires_at": now + timedelta(days=plan["duration_days"]),
+        })
+
+    # Sort by expires_at descending; the latest-expiring is the "display primary"
+    live.sort(key=lambda e: e["expires_at"], reverse=True)
+    primary = live[0]
+
+    await db.users.update_one(
+        {"user_id": user_id},
+        {"$set": {
+            "active_plans": live,
+            "plan": primary["plan_id"],
+            "plan_expires_at": primary["expires_at"],
+            "stream_slots": len(live),
+        }}
+    )
+    logger.info(
+        f"Plan '{plan_id}' activated for user {user_id} — total active plans = {len(live)} (slots)."
+    )
+    return await db.users.find_one({"user_id": user_id}, {"_id": 0, "password_hash": 0})
+
+
 async def check_active_plan(user: dict):
-    """Check if user has an active plan"""
-    if not user.get("plan") or not user.get("plan_expires_at"):
+    """Check if user has at least one non-expired plan (or lifetime)."""
+    if user.get("plan") == "lifetime":
+        return
+    live = _active_entries(user)
+    if not live:
+        # Also clear stale legacy fields
+        await db.users.update_one(
+            {"user_id": user["user_id"]},
+            {"$set": {"active_plans": [], "plan": None, "plan_expires_at": None, "stream_slots": 0}}
+        )
         raise HTTPException(
             status_code=403,
             detail="⚠️ Please purchase a slot/plan first to proceed."
         )
-    
-    # Lifetime plan bypass — admins/staff never expire
-    if user.get("plan") == "lifetime":
-        return
-    
-    # Check if plan is expired
-    expires_at = user["plan_expires_at"]
-    if isinstance(expires_at, str):
-        expires_at = datetime.fromisoformat(expires_at)
-    if expires_at.tzinfo is None:
-        expires_at = expires_at.replace(tzinfo=timezone.utc)
-    
-    if expires_at < datetime.now(timezone.utc):
-        # Plan expired, clear it
-        await db.users.update_one(
-            {"user_id": user["user_id"]},
-            {"$set": {"plan": None, "plan_expires_at": None}}
-        )
-        raise HTTPException(
-            status_code=403,
-            detail="⚠️ Your plan has expired. Please purchase a new plan to proceed."
-        )
+    # Auto-sync: prune expired entries + stop excess streams if a plan expired since last call
+    stored = user.get("active_plans") or []
+    if len(stored) != len(live) or any(_as_utc(e.get("expires_at")) is None for e in stored):
+        await sync_user_plans_and_enforce_slots(user)
 
 async def check_storage_limit(user: dict, additional_size: int):
     """Check if adding file would exceed 2GB storage limit"""
@@ -362,15 +512,26 @@ async def refresh_token(request: Request):
 @api_router.get("/auth/me")
 async def get_me(user: dict = Depends(get_current_user)):
     """Get current user info"""
+    live_plans = _active_entries(user)
+    # Serialize datetimes for JSON
+    active_plans_serial = [
+        {
+            "plan_id": e["plan_id"],
+            "purchased_at": e["purchased_at"].isoformat() if hasattr(e["purchased_at"], "isoformat") else str(e["purchased_at"]),
+            "expires_at": e["expires_at"].isoformat() if hasattr(e["expires_at"], "isoformat") else str(e["expires_at"]),
+        }
+        for e in live_plans
+    ]
     return {
         "user_id": user["user_id"],
         "email": user["email"],
         "name": user["name"],
         "plan": user.get("plan"),
         "plan_expires_at": user.get("plan_expires_at").isoformat() if user.get("plan_expires_at") else None,
+        "active_plans": active_plans_serial,
         "storage_used": user.get("storage_used", 0),
         "role": user.get("role"),
-        "stream_slots": user.get("stream_slots", 1),
+        "stream_slots": compute_stream_slots(user),
     }
 
 
@@ -1045,13 +1206,8 @@ async def activate_plan_from_transaction(session_id: str, payment_status: str) -
         return False
 
     plan_id = transaction["plan_id"]
-    plan = PLANS[plan_id]
-    expires_at = datetime.now(timezone.utc) + timedelta(days=plan["duration_days"])
-
-    await db.users.update_one(
-        {"user_id": transaction["user_id"]},
-        {"$set": {"plan": plan_id, "plan_expires_at": expires_at}}
-    )
+    # Slot-stacking activation
+    await activate_or_extend_plan(transaction["user_id"], plan_id)
     logger.info(f"Plan '{plan_id}' activated for user {transaction['user_id']} via session {session_id}")
     return True
 
@@ -1212,29 +1368,10 @@ async def razorpay_verify_payment(request: Request, user: dict = Depends(get_cur
 
     if result.modified_count > 0:
         plan_id = transaction["plan_id"]
-        plan = PLANS[plan_id]
-        now = datetime.now(timezone.utc)
-
-        # Recharge/renewal: if the user is buying the SAME plan they still hold,
-        # stack the new duration on top of the remaining validity instead of
-        # resetting from now (so they don't lose paid-for time).
-        base = now
-        current_plan = user.get("plan")
-        current_expiry = user.get("plan_expires_at")
-        if current_plan == plan_id and current_expiry:
-            if isinstance(current_expiry, str):
-                current_expiry = datetime.fromisoformat(current_expiry)
-            if current_expiry.tzinfo is None:
-                current_expiry = current_expiry.replace(tzinfo=timezone.utc)
-            if current_expiry > now:
-                base = current_expiry
-
-        expires_at = base + timedelta(days=plan["duration_days"])
-        await db.users.update_one(
-            {"user_id": user["user_id"]},
-            {"$set": {"plan": plan_id, "plan_expires_at": expires_at}}
-        )
-        logger.info(f"Razorpay plan '{plan_id}' activated/renewed for user {user['user_id']} (expires {expires_at.isoformat()})")
+        # Slot-stacking activation — appends a new entry per different plan,
+        # extends duration if the same plan is bought again.
+        await activate_or_extend_plan(user["user_id"], plan_id)
+        logger.info(f"Razorpay plan '{plan_id}' activated (slot-stacking) for user {user['user_id']}")
 
     return {"status": "success", "message": "Payment verified and plan activated"}
 
@@ -1271,12 +1408,8 @@ async def razorpay_webhook(request: Request):
                               "payment_id": payment_id, "completed_at": datetime.now(timezone.utc)}}
                 )
                 if res.modified_count > 0:
-                    plan = PLANS[txn["plan_id"]]
-                    expires_at = datetime.now(timezone.utc) + timedelta(days=plan["duration_days"])
-                    await db.users.update_one(
-                        {"user_id": txn["user_id"]},
-                        {"$set": {"plan": txn["plan_id"], "plan_expires_at": expires_at}}
-                    )
+                    # Slot-stacking activation (same code path as verify_payment)
+                    await activate_or_extend_plan(txn["user_id"], txn["plan_id"])
     return {"status": "processed"}
 
 # ==================== BILLING ENDPOINTS ====================
@@ -1526,7 +1659,7 @@ async def list_active_streams(user: dict = Depends(get_current_user)):
             s["started_at"] = s["started_at"].isoformat() if hasattr(s["started_at"], "isoformat") else str(s["started_at"])
         if not s.get("stream_id"):
             s["stream_id"] = f"stream_legacy_{uuid.uuid4().hex[:12]}"
-    max_slots = user.get("stream_slots", 1)
+    max_slots = compute_stream_slots(user)
     return {
         "active": streams,
         "count": len(streams),
@@ -1551,8 +1684,8 @@ async def start_stream_with_key(data: StreamKeyStart, user: dict = Depends(get_c
     if not video:
         raise HTTPException(status_code=404, detail="Video not found")
 
-    # Enforce concurrent-stream slot budget
-    max_slots = user.get("stream_slots", 1)
+    # Enforce concurrent-stream slot budget (slot-stacking aware)
+    max_slots = compute_stream_slots(user)
     active_count = await db.live_streams.count_documents(
         {"user_id": user["user_id"], "is_live": True}
     )
@@ -1663,7 +1796,7 @@ async def get_dashboard_stats(user: dict = Depends(get_current_user)):
     
     return {
         "active_live_slots": active_slots,
-        "max_stream_slots": user.get("stream_slots", 1),
+        "max_stream_slots": compute_stream_slots(user),
         "total_videos": video_count,
         "storage_used": user.get("storage_used", 0),
         "plan": user.get("plan"),
@@ -1734,6 +1867,37 @@ async def startup_event():
             {"$set": {"stream_id": new_sid}}
         )
         logger.info(f"Backfilled stream_id={new_sid} on legacy stream for user {legacy.get('user_id')}")
+
+    # One-time migration: users who had a single legacy `plan`+`plan_expires_at`
+    # but no `active_plans` array. Populate the array from the legacy fields so
+    # slot-stacking works transparently for pre-iter-10 users.
+    users_cursor = db.users.find({
+        "active_plans": {"$exists": False},
+        "plan": {"$exists": True, "$nin": [None, "", "lifetime"]},
+        "plan_expires_at": {"$exists": True, "$ne": None},
+    })
+    async for u in users_cursor:
+        legacy_exp = _as_utc(u.get("plan_expires_at"))
+        if not legacy_exp:
+            continue
+        now = datetime.now(timezone.utc)
+        # Only migrate non-expired plans
+        if legacy_exp > now:
+            entry = {
+                "plan_id": u["plan"],
+                "purchased_at": _as_utc(u.get("plan_started_at")) or now,
+                "expires_at": legacy_exp,
+            }
+            await db.users.update_one(
+                {"_id": u["_id"]},
+                {"$set": {"active_plans": [entry], "stream_slots": 1}}
+            )
+            logger.info(f"Migrated user {u.get('user_id')} to active_plans (plan={u['plan']})")
+        else:
+            await db.users.update_one(
+                {"_id": u["_id"]},
+                {"$set": {"active_plans": [], "plan": None, "plan_expires_at": None, "stream_slots": 0}}
+            )
     # Idempotency key for chunked uploads. Partial filter ensures only new
     # rows (with a string upload_id) are indexed — legacy rows without
     # upload_id are excluded. Prevents duplicate video docs on retried
