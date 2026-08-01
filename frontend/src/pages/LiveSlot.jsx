@@ -255,32 +255,38 @@ const LiveSlot = () => {
             Active Streams
           </h2>
           <div className="space-y-3">
-            {activeStreams.map((s) => (
-              <div
-                key={s.stream_id}
-                data-testid={`active-stream-${s.stream_id}`}
-                className="flex items-center justify-between gap-4 p-4 bg-gray-900/60 rounded-xl border border-gray-700"
-              >
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-2 mb-1">
-                    <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
-                    <span className="text-white font-semibold truncate">{s.current_video || 'Live stream'}</span>
-                  </div>
-                  <p className="text-gray-500 text-xs">
-                    Started {s.started_at ? new Date(s.started_at).toLocaleString() : '—'} · Slot ID: {s.stream_id.slice(-6)}
-                  </p>
-                </div>
-                <Button
-                  size="sm"
-                  variant="destructive"
-                  onClick={() => handleStopSpecific(s.stream_id)}
-                  data-testid={`stop-stream-${s.stream_id}`}
+            {activeStreams.map((s, idx) => {
+              const sid = s.stream_id || `legacy_${idx}`;
+              const slotTail = s.stream_id ? s.stream_id.slice(-6) : `legacy-${idx + 1}`;
+              return (
+                <div
+                  key={sid}
+                  data-testid={`active-stream-${sid}`}
+                  className="flex items-center justify-between gap-4 p-4 bg-gray-900/60 rounded-xl border border-gray-700"
                 >
-                  <StopCircle className="w-4 h-4 mr-1" />
-                  Stop
-                </Button>
-              </div>
-            ))}
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2 mb-1">
+                      <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
+                      <span className="text-white font-semibold truncate">{s.current_video || 'Live stream'}</span>
+                    </div>
+                    <p className="text-gray-500 text-xs">
+                      Started {s.started_at ? new Date(s.started_at).toLocaleString() : '—'} · Slot ID: {slotTail}
+                    </p>
+                  </div>
+                  <Button
+                    size="sm"
+                    variant="destructive"
+                    onClick={() => handleStopSpecific(s.stream_id)}
+                    data-testid={`stop-stream-${sid}`}
+                    disabled={!s.stream_id}
+                    title={!s.stream_id ? 'Legacy stream — use the main Stop button below to clear it' : undefined}
+                  >
+                    <StopCircle className="w-4 h-4 mr-1" />
+                    Stop
+                  </Button>
+                </div>
+              );
+            })}
           </div>
           {slotInfo.slots_available > 0 && (
             <p className="text-emerald-400 text-xs mt-3">

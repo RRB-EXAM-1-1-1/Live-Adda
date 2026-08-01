@@ -1520,10 +1520,12 @@ async def list_active_streams(user: dict = Depends(get_current_user)):
         {"user_id": user["user_id"], "is_live": True},
         {"_id": 0, "ffmpeg_pid": 0}
     ).sort("started_at", -1).to_list(50)
-    # Serialize datetime
+    # Serialize datetime + ensure stream_id is always present (defensive for legacy docs)
     for s in streams:
         if s.get("started_at"):
             s["started_at"] = s["started_at"].isoformat() if hasattr(s["started_at"], "isoformat") else str(s["started_at"])
+        if not s.get("stream_id"):
+            s["stream_id"] = f"stream_legacy_{uuid.uuid4().hex[:12]}"
     max_slots = user.get("stream_slots", 1)
     return {
         "active": streams,
@@ -1720,6 +1722,18 @@ async def startup_event():
     await db.videos.create_index("user_id")
     # Speeds up multi-slot count/list queries.
     await db.live_streams.create_index("user_id")
+
+    # One-time migration: backfill stream_id on any legacy live_streams docs
+    # (docs created before iter-9 didn't have this field, which crashed the
+    # LiveSlot UI with "Cannot read properties of undefined (reading 'slice')").
+    cursor = db.live_streams.find({"stream_id": {"$exists": False}})
+    async for legacy in cursor:
+        new_sid = f"stream_legacy_{uuid.uuid4().hex[:12]}"
+        await db.live_streams.update_one(
+            {"_id": legacy["_id"]},
+            {"$set": {"stream_id": new_sid}}
+        )
+        logger.info(f"Backfilled stream_id={new_sid} on legacy stream for user {legacy.get('user_id')}")
     # Idempotency key for chunked uploads. Partial filter ensures only new
     # rows (with a string upload_id) are indexed — legacy rows without
     # upload_id are excluded. Prevents duplicate video docs on retried
