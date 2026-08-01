@@ -16,6 +16,7 @@ import {
 import { Button } from '../components/ui/button';
 import { useAuth } from '../contexts/AuthContext';
 import GlobalUploadIndicator from '../components/GlobalUploadIndicator';
+import DashboardErrorBoundary from '../components/DashboardErrorBoundary';
 
 const DashboardLayout = () => {
   const navigate = useNavigate();
@@ -158,7 +159,9 @@ const DashboardLayout = () => {
       {/* Main Content */}
       <main className="lg:ml-64 min-h-screen">
         <div className="p-6 lg:p-8 pt-20 lg:pt-8">
-          <Outlet />
+          <DashboardErrorBoundary>
+            <Outlet />
+          </DashboardErrorBoundary>
         </div>
       </main>
 
