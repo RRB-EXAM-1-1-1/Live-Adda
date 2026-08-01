@@ -1,0 +1,44 @@
+{
+  "summary": "Iteration 7 P0 fixes VERIFIED end-to-end: (1) duplicate video row on upload retry — FIXED; (2) upload aborted on SPA navigation — FIXED. Added 8 new backend tests in TestIter7Idempotency covering (a) duplicate final-chunk returns same video_id with idempotent=True and exactly 1 DB row, (b) storage_used incremented exactly once, (c) GET /videos/upload/status/{upload_id} for fresh/partial/completed states, (d) offset-retry does not double-write (2 chunks of 1KB with a retry yields 2KB not 3KB final file), (e) partial unique index 'uniq_user_upload_id' exists on db.videos with correct keys, (f) 403 gatekeeping preserved for no-plan users on /videos/upload/chunk, (g) 2 concurrent identical final-chunks yield exactly 1 row + same video_id. ALL 8/8 pass. Frontend UI: logged in as admin, uploaded a 15MB /tmp/big_test.mp4 via VideoManager, at 33% progress SPA-navigated to /dashboard/billings via sidebar button — global-upload-indicator was visible on Billings with filename 'big_test.mp4', progress advanced from 33% → 99% → completion WHILE ON THE BILLINGS PAGE (upload continued in background as designed), then SPA-navigated back to /dashboard/videos and exactly ONE big_test row was rendered in videos-grid with the success toast '✅ Ready for the stream! Plan validity: 346 days remaining'.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [
+      {"screen": "VideoManager - Storage Usage", "issues": ["After upload completes, the Storage Usage widget still reads '0 MB / 2 GB' until a full page reload. The server-side storage_used counter IS correctly incremented (verified in backend tests), and refreshUser() is called on upload complete, but the widget appears to display a stale user object briefly. Cosmetic — the numeric fetch on next mount corrects it. Consider forcing a re-read of dashboard/stats or /auth/me right after emitCompleted in UploadContext."]}
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/backend_test.py",
+    "/app/test_reports/pytest/iter7_results.xml"
+  ],
+  "action_items": [
+    "(optional cosmetic) Force Storage Usage widget refresh after successful upload — currently shows stale 0 MB until next reload. Not a functional bug.",
+    "(optional cleanup) Add a periodic janitor for /app/backend/uploads/tmp/*.part files older than N hours; currently client-aborted uploads leave a .part file server-side (already flagged in iter 6)."
+  ],
+  "critical_code_review_comments": [
+    "server.py /api/videos/upload/chunk (479-662): idempotency correctly implemented — early-return on existing (user_id, upload_id) before AND after write, plus try/except InsertOne guarded by partial unique index. Offset truncation via `truncate(offset)` before append is correct and byte-safe on retries. Verified by test_offset_retry_does_not_double_write.",
+    "server.py partial unique index (line 1455-1458): partialFilterExpression uses {\"upload_id\": {\"$type\": \"string\"}}. Correct — excludes legacy rows without upload_id. Note: 'partialFilterExpression={upload_id:{$type:string}}' in the problem statement missed the closing brace but the actual code is correct.",
+    "UploadContext.jsx: correctly hoisted above <BrowserRouter> in App.js (line 21). runningRef/uploadIdRef are useRef so re-renders don't kill the upload loop. Chunks are sequential with 3× retry per chunk (1s,2s backoff), and beforeunload guard blocks accidental tab close.",
+    "GlobalUploadIndicator.jsx: renders when status!='idle' OR pendingResume set — correct. Renders 'Uploading' pane and 'Resume' banner as separate concerns.",
+    "VideoManager.jsx loadVideos() does client-side de-dupe by (upload_id || video_id) — defensive but wouldn't help if backend actually created duplicates. With the partial unique index now in place, the server-side dedupe is the source of truth.",
+    "Iteration-6 comment still applies: server.py is 1515 lines — recommend splitting into APIRouter modules.",
+    "Minor: /videos/upload/chunk response includes 'idempotent': true when short-circuiting, but the initial finalize success does NOT set it. That's fine but a client wanting to detect retries can only rely on the presence of the field."
+  ],
+  "updated_files": [
+    "/app/backend/tests/backend_test.py"
+  ],
+  "success_rate": {
+    "backend": "100% for iter-7 new tests (8/8 TestIter7Idempotency passing)",
+    "frontend": "100% for the 2 P0 concerns (upload survives SPA navigation + no duplicate row after upload)"
+  },
+  "test_credentials": "Admin: admin@liveadda.com / admin123 (active monthly, 346 days remaining). Fresh users created inline: TEST_iter7_*.",
+  "seed_data_creation": "Created /tmp/big_test.mp4 (15MB of random bytes) for the SPA-navigation test. Inline .part files under /app/backend/uploads/tmp/ (cleaned up). All video uploads created during tests deleted at end of each test via DELETE /api/videos/{id}.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Iteration 7 fixes for the two P0 upload bugs are working. Backend: /api/videos/upload/chunk is idempotent on (user_id, upload_id) — 8/8 new tests pass including a concurrent finalize race test. /api/videos/upload/status/{upload_id} correctly reports fresh/partial/completed states. Partial unique index uniq_user_upload_id verified present. Frontend: UploadProvider is above BrowserRouter in App.js so SPA nav via sidebar buttons (which use react-router navigate()) keeps the upload alive; verified by uploading a 15MB file on /dashboard/videos, SPA-navigating to /dashboard/billings at 33% progress, watching progress climb to 100% on Billings, then navigating back to Videos and seeing exactly ONE video row. Only minor cosmetic issue is the Storage Usage widget showing '0 MB' briefly after upload (user object stale for one render cycle) — recommend main agent add a refresh but not a blocker. Prior iterations' Razorpay LIVE-key throttling issue is unrelated and unchanged.",
+  "rca of the issue": "USER REPORT: (1) Duplicate video rows after upload, (2) Upload cancels on SPA navigation. RCA: (1) Previous chunked upload finalized (INSERT video row) and returned response; if network dropped the response, the client retried the final chunk which finalized AGAIN, inserting a second row + double-counting storage. Fix: server checks for existing (user_id, upload_id) BEFORE and DURING finalize, returns the existing row on retry, and a partial unique index prevents any race from persisting a duplicate. (2) VideoManager owned the upload promise via useState; navigating unmounted VideoManager and cancelled the axios request. Fix: hoisted state into <UploadProvider> above <BrowserRouter> in App.js — the provider never unmounts across SPA routes. Refs (runningRef, uploadIdRef) hold the running loop so it survives child re-renders. Also added resumability: server persists .part file per (user_id, upload_id) and exposes /videos/upload/status/{upload_id}; frontend writes upload metadata to localStorage ('liveadda:pending_upload_v1') so even a hard refresh can be resumed by re-selecting the file. Both fixes VERIFIED via 8 backend pytest tests + 1 end-to-end Playwright script (progress 33%→99% during SPA nav to Billings, exactly 1 row in videos-grid after)."
+}

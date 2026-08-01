@@ -13,6 +13,7 @@ import {
 } from 'lucide-react';
 import { Button } from '../components/ui/button';
 import { useAuth } from '../contexts/AuthContext';
+import GlobalUploadIndicator from '../components/GlobalUploadIndicator';
 
 const DashboardLayout = () => {
   const navigate = useNavigate();
@@ -135,6 +136,9 @@ const DashboardLayout = () => {
           onClick={() => setSidebarOpen(false)}
         />
       )}
+
+      {/* Floating upload progress — visible from ANY dashboard page */}
+      <GlobalUploadIndicator />
     </div>
   );
 };

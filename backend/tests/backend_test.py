@@ -1297,3 +1297,237 @@ class TestDashboardStatsPlanReflection:
         data = r.json()
         assert data.get("plan") is None
         assert data.get("plan_expires_at") is None
+
+
+
+# ==================== Iteration 7: Idempotent Chunked Upload + Resumability ====================
+
+class TestIter7Idempotency:
+    """Iteration 7: (user_id, upload_id) idempotency; retried finalize returns
+    same video_id, no duplicate DB row, storage counted once."""
+
+    @pytest.fixture
+    def plan_user(self):
+        from datetime import datetime, timezone, timedelta
+        s = requests.Session()
+        email = f"TEST_iter7_{uuid.uuid4().hex[:8]}@example.com"
+        r = s.post(f"{API}/auth/register", json={
+            "email": email, "password": "iter7pw1", "name": "Iter7 Tester"
+        }, timeout=30)
+        assert r.status_code == 200, r.text
+        uid = r.json()["user_id"]
+        db = _get_mongo_db_static()
+        db.users.update_one({"user_id": uid}, {"$set": {
+            "plan": "daily",
+            "plan_expires_at": datetime.now(timezone.utc) + timedelta(days=1),
+            "storage_used": 0,
+        }})
+        yield s, email, uid
+        db.videos.delete_many({"user_id": uid})
+        db.users.delete_one({"user_id": uid})
+
+    def _post_chunk(self, session, upload_id, chunk_index, total_chunks,
+                    filename, title, offset, content):
+        files = {"file": (filename, io.BytesIO(content), "video/mp4")}
+        data = {
+            "upload_id": upload_id,
+            "chunk_index": chunk_index,
+            "total_chunks": total_chunks,
+            "filename": filename,
+            "title": title,
+            "offset": offset,
+        }
+        return session.post(f"{API}/videos/upload/chunk", files=files, data=data, timeout=60)
+
+    def test_duplicate_final_chunk_returns_same_video_id_no_double_row(self, plan_user):
+        """The core bug fix: sending the same single-chunk upload twice must NOT
+        create two video rows. Second call returns same video_id and idempotent=True."""
+        s, _, uid = plan_user
+        upload_id = uuid.uuid4().hex[:16]
+        payload = os.urandom(2048)
+
+        me0 = s.get(f"{API}/auth/me", timeout=15).json()
+        storage_before = me0.get("storage_used", 0)
+
+        # First upload -> creates the video
+        r1 = self._post_chunk(s, upload_id, 0, 1, "dup.mp4",
+                              "TEST_iter7_dup", 0, payload)
+        assert r1.status_code == 200, r1.text
+        body1 = r1.json()
+        assert body1["status"] == "completed"
+        vid1 = body1["video_id"]
+        assert body1["size"] == len(payload)
+
+        # Second identical upload -> idempotent, same video_id
+        r2 = self._post_chunk(s, upload_id, 0, 1, "dup.mp4",
+                              "TEST_iter7_dup", 0, payload)
+        assert r2.status_code == 200, r2.text
+        body2 = r2.json()
+        assert body2["status"] == "completed"
+        assert body2["video_id"] == vid1, (
+            f"expected same video_id on retry, got {vid1} vs {body2['video_id']}"
+        )
+        assert body2.get("idempotent") is True
+
+        # GET /api/videos returns exactly ONE video for this upload_id
+        db = _get_mongo_db_static()
+        rows = list(db.videos.find({"user_id": uid, "upload_id": upload_id}))
+        assert len(rows) == 1, f"expected 1 video row, got {len(rows)}"
+
+        # Storage_used incremented exactly ONCE
+        me1 = s.get(f"{API}/auth/me", timeout=15).json()
+        assert me1["storage_used"] == storage_before + len(payload), (
+            f"storage counted twice: before={storage_before}, after={me1['storage_used']}, "
+            f"payload={len(payload)}"
+        )
+
+    def test_status_endpoint_fresh_upload(self, plan_user):
+        s, _, uid = plan_user
+        upload_id = uuid.uuid4().hex[:16]
+        r = s.get(f"{API}/videos/upload/status/{upload_id}", timeout=15)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["completed"] is False
+        assert body["received_bytes"] == 0
+
+    def test_status_endpoint_after_partial_chunk(self, plan_user):
+        s, _, uid = plan_user
+        upload_id = uuid.uuid4().hex[:16]
+        # Send chunk 0 of 3 (non-final)
+        r0 = self._post_chunk(s, upload_id, 0, 3, "p.mp4",
+                              "TEST_iter7_partial", 0, b"A" * 512)
+        assert r0.status_code == 200, r0.text
+        assert r0.json()["status"] == "chunk_received"
+        r = s.get(f"{API}/videos/upload/status/{upload_id}", timeout=15)
+        assert r.status_code == 200
+        body = r.json()
+        assert body["completed"] is False
+        assert body["received_bytes"] == 512
+        # Cleanup part file
+        from pathlib import Path as _P
+        p = _P("/app/backend/uploads/tmp") / f"{uid}_{upload_id}.part"
+        if p.exists():
+            p.unlink()
+
+    def test_status_endpoint_after_completion(self, plan_user):
+        s, _, uid = plan_user
+        upload_id = uuid.uuid4().hex[:16]
+        payload = b"Z" * 1024
+        r1 = self._post_chunk(s, upload_id, 0, 1, "done.mp4",
+                              "TEST_iter7_done", 0, payload)
+        assert r1.status_code == 200
+        vid = r1.json()["video_id"]
+        r = s.get(f"{API}/videos/upload/status/{upload_id}", timeout=15)
+        assert r.status_code == 200
+        body = r.json()
+        assert body["completed"] is True
+        assert body["received_bytes"] == len(payload)
+        assert body["video_id"] == vid
+
+    def test_offset_retry_does_not_double_write(self, plan_user):
+        """Send chunk 0 (offset=0, 1KB), chunk 1 (offset=1024, 1KB),
+        then RETRY chunk 1 (same offset=1024, 1KB). Final file must be 2KB, not 3KB."""
+        s, _, uid = plan_user
+        upload_id = uuid.uuid4().hex[:16]
+        chunk_size = 1024
+        c0 = b"a" * chunk_size
+        c1 = b"b" * chunk_size
+
+        # Chunk 0 (non-final since total_chunks=2)
+        r0 = self._post_chunk(s, upload_id, 0, 2, "off.mp4",
+                              "TEST_iter7_offset", 0, c0)
+        assert r0.status_code == 200, r0.text
+        assert r0.json()["status"] == "chunk_received"
+        assert r0.json()["received_bytes"] == chunk_size
+
+        # Chunk 1 retry #1 - final chunk. This finalizes the video.
+        r1 = self._post_chunk(s, upload_id, 1, 2, "off.mp4",
+                              "TEST_iter7_offset", chunk_size, c1)
+        assert r1.status_code == 200, r1.text
+        body = r1.json()
+        assert body["status"] == "completed"
+        vid = body["video_id"]
+        assert body["size"] == 2 * chunk_size, f"final size wrong: {body['size']}"
+
+        # Retry the same "final chunk" - must be idempotent, size still 2KB
+        r2 = self._post_chunk(s, upload_id, 1, 2, "off.mp4",
+                              "TEST_iter7_offset", chunk_size, c1)
+        assert r2.status_code == 200, r2.text
+        body2 = r2.json()
+        assert body2["video_id"] == vid
+        assert body2["size"] == 2 * chunk_size
+
+        # Only 1 video row
+        db = _get_mongo_db_static()
+        rows = list(db.videos.find({"user_id": uid, "upload_id": upload_id}))
+        assert len(rows) == 1
+        assert rows[0]["size"] == 2 * chunk_size
+
+    def test_unique_index_exists_on_videos(self):
+        """Verify db.videos has partial unique index on (user_id, upload_id)."""
+        db = _get_mongo_db_static()
+        indexes = list(db.videos.list_indexes())
+        target = next((i for i in indexes if i.get("name") == "uniq_user_upload_id"), None)
+        assert target is not None, f"index uniq_user_upload_id missing. Existing: {[i.get('name') for i in indexes]}"
+        assert target.get("unique") is True
+        key = list(target["key"].items())
+        assert key == [("user_id", 1), ("upload_id", 1)], f"unexpected key: {key}"
+        # Partial filter should include upload_id string constraint
+        pfe = target.get("partialFilterExpression", {})
+        assert "upload_id" in pfe
+
+    def test_gatekeeping_still_enforced_on_chunk_endpoint(self, fresh_user):
+        """Regression: no-plan users still get 403 with exact message."""
+        s, _, _ = fresh_user
+        upload_id = uuid.uuid4().hex[:16]
+        files = {"file": ("gk.mp4", io.BytesIO(b"x" * 100), "video/mp4")}
+        data = {
+            "upload_id": upload_id,
+            "chunk_index": 0,
+            "total_chunks": 1,
+            "filename": "gk.mp4",
+            "title": "TEST_iter7_gk",
+            "offset": 0,
+        }
+        r = s.post(f"{API}/videos/upload/chunk", files=files, data=data, timeout=30)
+        assert r.status_code in (402, 403), r.text
+        detail = r.json().get("detail", "")
+        # Accept the exact purchase message
+        assert "purchase" in detail.lower() or "plan" in detail.lower(), detail
+
+    def test_concurrent_final_chunks_yield_one_row(self, plan_user):
+        """Fire 2 identical final-chunk requests concurrently. At most one
+        video row must be created."""
+        import concurrent.futures as _cf
+        s, _, uid = plan_user
+        upload_id = uuid.uuid4().hex[:16]
+        payload = os.urandom(3000)
+
+        def _fire():
+            # Use a fresh session-like object cloned from `s` (share cookies)
+            files = {"file": ("conc.mp4", io.BytesIO(payload), "video/mp4")}
+            data = {
+                "upload_id": upload_id,
+                "chunk_index": 0,
+                "total_chunks": 1,
+                "filename": "conc.mp4",
+                "title": "TEST_iter7_conc",
+                "offset": 0,
+            }
+            return s.post(f"{API}/videos/upload/chunk",
+                          files=files, data=data, timeout=60)
+
+        with _cf.ThreadPoolExecutor(max_workers=2) as ex:
+            futs = [ex.submit(_fire) for _ in range(2)]
+            responses = [f.result() for f in futs]
+
+        # Both should return 200 (one creates, one is idempotent)
+        assert all(r.status_code == 200 for r in responses), \
+            [(r.status_code, r.text[:200]) for r in responses]
+        vids = {r.json()["video_id"] for r in responses}
+        assert len(vids) == 1, f"different video_ids: {vids}"
+
+        # DB must have exactly 1 row
+        db = _get_mongo_db_static()
+        rows = list(db.videos.find({"user_id": uid, "upload_id": upload_id}))
+        assert len(rows) == 1, f"concurrent finalize created {len(rows)} rows"

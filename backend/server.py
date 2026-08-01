@@ -476,6 +476,30 @@ def _plan_validity_message(user: dict) -> str:
     remaining_hours = int(remaining_seconds // 3600)
     return f"{remaining_days} days remaining" if remaining_days >= 1 else f"{remaining_hours} hours remaining"
 
+@api_router.get("/videos/upload/status/{upload_id}")
+async def get_upload_status(upload_id: str, user: dict = Depends(get_current_user)):
+    """Returns how many bytes the server has already received for this upload_id,
+    or the finalized video if the upload has already completed. Used by the
+    frontend to resume interrupted uploads without re-sending completed chunks."""
+    # Was it already finalized?
+    existing = await db.videos.find_one(
+        {"user_id": user["user_id"], "upload_id": upload_id},
+        {"_id": 0}
+    )
+    if existing:
+        return {
+            "completed": True,
+            "received_bytes": existing["size"],
+            "video_id": existing["video_id"],
+            "title": existing["title"],
+        }
+
+    safe_id = f"{user['user_id']}_{upload_id}".replace("/", "_")
+    part_path = UPLOAD_DIR / "tmp" / f"{safe_id}.part"
+    received = part_path.stat().st_size if part_path.exists() else 0
+    return {"completed": False, "received_bytes": received}
+
+
 @api_router.post("/videos/upload/chunk")
 async def upload_video_chunk(
     upload_id: str = Form(...),
@@ -484,12 +508,35 @@ async def upload_video_chunk(
     filename: str = Form(...),
     title: str = Form(...),
     file: UploadFile = File(...),
+    offset: int = Form(0),
     user: dict = Depends(get_current_user)
 ):
-    """Chunked upload: receive one small chunk at a time and append it.
-    Small requests avoid proxy 413 limits and survive flaky connections.
-    On the final chunk the file is finalized and registered."""
+    """Chunked, resumable, idempotent upload.
+    - `offset` is the byte position where this chunk begins in the final file.
+    - The server truncates the part file to `offset` before appending, so
+      retrying the same chunk (transient network fail) never causes duplication.
+    - Finalize is idempotent on `(user_id, upload_id)`: a retried final chunk
+      returns the existing video instead of inserting a second row.
+    """
     await check_active_plan(user)
+
+    # If this upload is already finalized, short-circuit idempotently
+    existing = await db.videos.find_one(
+        {"user_id": user["user_id"], "upload_id": upload_id},
+        {"_id": 0}
+    )
+    if existing:
+        return {
+            "status": "completed",
+            "video_id": existing["video_id"],
+            "title": existing["title"],
+            "size": existing["size"],
+            "uploaded_at": (existing["uploaded_at"].isoformat()
+                            if hasattr(existing["uploaded_at"], "isoformat")
+                            else str(existing["uploaded_at"])),
+            "message": f"✅ Ready for the stream! Plan validity: {_plan_validity_message(user)}",
+            "idempotent": True,
+        }
 
     # Namespace the temp file by user to prevent collisions/abuse
     safe_id = f"{user['user_id']}_{upload_id}".replace("/", "_")
@@ -497,29 +544,63 @@ async def upload_video_chunk(
     tmp_dir.mkdir(parents=True, exist_ok=True)
     part_path = tmp_dir / f"{safe_id}.part"
 
-    # Fresh start on first chunk
-    if chunk_index == 0 and part_path.exists():
+    # Fresh start on chunk 0 with offset 0
+    if chunk_index == 0 and offset == 0 and part_path.exists():
         part_path.unlink()
 
+    # Read the chunk bytes
     content = await file.read()
-    async with aiofiles.open(part_path, 'ab') as f:
-        await f.write(content)
 
-    # Enforce the 2GB budget incrementally
-    current_size = part_path.stat().st_size
+    # Enforce the 2GB budget incrementally (based on final projected size)
+    projected_size = offset + len(content)
     remaining_budget = MAX_STORAGE_BYTES - user.get("storage_used", 0)
-    if current_size > remaining_budget:
+    if projected_size > remaining_budget:
         part_path.unlink(missing_ok=True)
         raise HTTPException(
             status_code=400,
             detail=f"Storage limit exceeded. You have {MAX_STORAGE_BYTES / (1024**3):.0f} GB limit."
         )
 
+    # Truncate/create at the exact offset so retries are byte-safe.
+    # `r+b` requires the file to exist and won't truncate; we handle both cases.
+    current_size = part_path.stat().st_size if part_path.exists() else 0
+    if offset > current_size:
+        # Client is skipping bytes the server never received — refuse.
+        raise HTTPException(
+            status_code=409,
+            detail=f"Upload offset gap: server has {current_size} bytes, client sent offset {offset}. Restart upload."
+        )
+    # Truncate to offset (drops any bytes past this point from a prior retry)
+    async with aiofiles.open(part_path, 'ab') as f:
+        await f.truncate(offset)
+        await f.write(content)
+
     # Not the last chunk yet
     if chunk_index + 1 < total_chunks:
-        return {"status": "chunk_received", "chunk_index": chunk_index}
+        return {
+            "status": "chunk_received",
+            "chunk_index": chunk_index,
+            "received_bytes": part_path.stat().st_size,
+        }
 
-    # Final chunk -> finalize
+    # Final chunk -> finalize (guarded again against concurrent duplicate finalize)
+    existing = await db.videos.find_one(
+        {"user_id": user["user_id"], "upload_id": upload_id},
+        {"_id": 0}
+    )
+    if existing:
+        return {
+            "status": "completed",
+            "video_id": existing["video_id"],
+            "title": existing["title"],
+            "size": existing["size"],
+            "uploaded_at": (existing["uploaded_at"].isoformat()
+                            if hasattr(existing["uploaded_at"], "isoformat")
+                            else str(existing["uploaded_at"])),
+            "message": f"✅ Ready for the stream! Plan validity: {_plan_validity_message(user)}",
+            "idempotent": True,
+        }
+
     video_id = f"video_{uuid.uuid4().hex[:12]}"
     file_extension = Path(filename).suffix or ".mp4"
     final_path = UPLOAD_DIR / f"{video_id}{file_extension}"
@@ -529,6 +610,7 @@ async def upload_video_chunk(
     video_doc = {
         "video_id": video_id,
         "user_id": user["user_id"],
+        "upload_id": upload_id,  # idempotency key
         "title": title,
         "duration": "00:00",
         "size": file_size,
@@ -537,7 +619,34 @@ async def upload_video_chunk(
         "uploaded_at": datetime.now(timezone.utc),
         "processing_status": "completed"
     }
-    await db.videos.insert_one(video_doc)
+    try:
+        await db.videos.insert_one(video_doc)
+    except Exception as e:
+        # Unique index on (user_id, upload_id) — another finalize won the race.
+        logger.warning(f"Finalize race for upload_id={upload_id}: {e}")
+        # Clean up the duplicate file we just renamed and return the existing one.
+        try:
+            final_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        existing = await db.videos.find_one(
+            {"user_id": user["user_id"], "upload_id": upload_id},
+            {"_id": 0}
+        )
+        if existing:
+            return {
+                "status": "completed",
+                "video_id": existing["video_id"],
+                "title": existing["title"],
+                "size": existing["size"],
+                "uploaded_at": (existing["uploaded_at"].isoformat()
+                                if hasattr(existing["uploaded_at"], "isoformat")
+                                else str(existing["uploaded_at"])),
+                "message": f"✅ Ready for the stream! Plan validity: {_plan_validity_message(user)}",
+                "idempotent": True,
+            }
+        raise
+
     await db.users.update_one(
         {"user_id": user["user_id"]},
         {"$inc": {"storage_used": file_size}}
@@ -1338,6 +1447,16 @@ async def startup_event():
     await db.users.create_index("email", unique=True)
     await db.users.create_index("user_id", unique=True)
     await db.videos.create_index("user_id")
+    # Idempotency key for chunked uploads. Partial filter ensures only new
+    # rows (with a string upload_id) are indexed — legacy rows without
+    # upload_id are excluded. Prevents duplicate video docs on retried
+    # final-chunk uploads.
+    await db.videos.create_index(
+        [("user_id", 1), ("upload_id", 1)],
+        unique=True,
+        partialFilterExpression={"upload_id": {"$type": "string"}},
+        name="uniq_user_upload_id"
+    )
     await db.payment_transactions.create_index("session_id")
     
     # Seed admin user

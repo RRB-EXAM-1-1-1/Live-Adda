@@ -13,6 +13,7 @@ import {
 } from '../components/ui/dialog';
 import { videoAPI } from '../services/api';
 import { useAuth } from '../contexts/AuthContext';
+import { useUpload } from '../contexts/UploadContext';
 import { toast } from 'sonner';
 
 const MAX_STORAGE_GB = 2;
@@ -27,10 +28,9 @@ const formatBytes = (bytes) => {
 
 const VideoManager = () => {
   const { user, refreshUser } = useAuth();
+  const { startUpload, isUploading, progress, onComplete } = useUpload();
   const [videos, setVideos] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [uploading, setUploading] = useState(false);
-  const [uploadProgress, setUploadProgress] = useState(0);
   const [showPlanDialog, setShowPlanDialog] = useState(false);
   const [renameDialog, setRenameDialog] = useState({ open: false, videoId: null, currentTitle: '' });
   const [newTitle, setNewTitle] = useState('');
@@ -44,11 +44,32 @@ const VideoManager = () => {
     loadVideos();
   }, []);
 
+  // When ANY upload (started from this page or elsewhere) completes, refresh
+  // the video list + user's storage counters. This runs even if the upload
+  // finished while the user was on a different page.
+  useEffect(() => {
+    const off = onComplete(async () => {
+      await loadVideos();
+      await refreshUser();
+    });
+    return off;
+  }, [onComplete, refreshUser]);
+
   const loadVideos = async () => {
     setLoading(true);
-    const { data, error } = await videoAPI.getAll();
+    const { data } = await videoAPI.getAll();
     if (data) {
-      setVideos(data);
+      // Defensive de-dupe: if any legacy duplicates exist in DB, only show the
+      // first per (upload_id) or video_id.
+      const seen = new Set();
+      const deduped = [];
+      for (const v of data) {
+        const key = v.upload_id || v.video_id;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        deduped.push(v);
+      }
+      setVideos(deduped);
     }
     setLoading(false);
   };
@@ -58,42 +79,30 @@ const VideoManager = () => {
       setShowPlanDialog(true);
       return;
     }
+    if (isUploading) {
+      toast.info('An upload is already in progress.');
+      return;
+    }
     fileInputRef.current?.click();
   };
 
   const handleFileSelect = async (e) => {
     const file = e.target.files[0];
+    e.target.value = '';
     if (!file) return;
 
-    // Reset input
-    e.target.value = '';
-
-    // Check storage
     if ((storageUsed + file.size) > MAX_STORAGE_BYTES) {
       toast.error(`Storage limit exceeded! You have ${MAX_STORAGE_GB}GB limit.`);
       return;
     }
 
     const title = file.name.replace(/\.[^/.]+$/, '');
-
-    setUploading(true);
-    setUploadProgress(0);
-
-    const { data, error } = await videoAPI.upload(file, title, (progress) => {
-      setUploadProgress(progress);
-    });
-
-    setUploading(false);
-
-    if (data) {
-      toast.success(data.message || '✅ Ready for the stream!');
-      await loadVideos();
-      await refreshUser();
-    } else {
-      if (error && error.includes('purchase')) {
+    // Fire-and-forget: the global UploadContext owns the promise, so it
+    // survives navigation away from this page.
+    const result = await startUpload(file, title);
+    if (result?.error) {
+      if (typeof result.error === 'string' && result.error.includes('purchase')) {
         setShowPlanDialog(true);
-      } else {
-        toast.error(error || 'Upload failed');
       }
     }
   };
@@ -152,27 +161,27 @@ const VideoManager = () => {
         </div>
         <Button 
           onClick={handleUploadClick}
-          disabled={uploading}
+          disabled={isUploading}
           data-testid="upload-video-button"
           className="bg-gradient-to-r from-emerald-500 to-emerald-600 hover:from-emerald-600 hover:to-emerald-700 text-white"
         >
           <Upload className="w-4 h-4 mr-2" />
-          {uploading ? 'Uploading...' : 'Upload Video'}
+          {isUploading ? 'Uploading...' : 'Upload Video'}
         </Button>
       </div>
 
       {/* Upload Progress */}
-      {uploading && (
+      {isUploading && (
         <div className="bg-gray-800/50 backdrop-blur-lg rounded-2xl p-6 border border-blue-500/50" data-testid="upload-progress-container">
           <div className="flex items-center justify-between mb-3">
             <h3 className="text-lg font-semibold text-white flex items-center">
               <Upload className="w-5 h-5 mr-2 text-blue-500 animate-pulse" />
               Uploading & Processing...
             </h3>
-            <span className="text-2xl font-bold text-blue-400" data-testid="upload-progress-percent">{uploadProgress}%</span>
+            <span className="text-2xl font-bold text-blue-400" data-testid="upload-progress-percent">{progress}%</span>
           </div>
-          <Progress value={uploadProgress} className="h-3" />
-          <p className="text-gray-400 text-sm mt-2">Please wait while we process your video...</p>
+          <Progress value={progress} className="h-3" />
+          <p className="text-gray-400 text-sm mt-2">Uploading in the background — you can navigate to other pages, the upload will not stop.</p>
         </div>
       )}
 

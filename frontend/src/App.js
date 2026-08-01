@@ -1,6 +1,7 @@
 import "@/App.css";
 import { BrowserRouter, Routes, Route } from "react-router-dom";
 import { AuthProvider } from "./contexts/AuthContext";
+import { UploadProvider } from "./contexts/UploadContext";
 import { ProtectedRoute } from "./components/ProtectedRoute";
 import { Toaster } from "./components/ui/sonner";
 import LandingPage from "./pages/LandingPage";
@@ -17,21 +18,23 @@ function App() {
   return (
     <div className="App">
       <AuthProvider>
-        <BrowserRouter>
-          <Routes>
-            <Route path="/" element={<LandingPage />} />
-            <Route path="/login" element={<Login />} />
-            <Route path="/register" element={<Register />} />
-            <Route path="/dashboard" element={<ProtectedRoute><DashboardLayout /></ProtectedRoute>}>
-              <Route index element={<Dashboard />} />
-              <Route path="videos" element={<VideoManager />} />
-              <Route path="live-slot" element={<LiveSlot />} />
-              <Route path="billings" element={<Billings />} />
-              <Route path="support" element={<Support />} />
-            </Route>
-          </Routes>
-          <Toaster position="bottom-right" />
-        </BrowserRouter>
+        <UploadProvider>
+          <BrowserRouter>
+            <Routes>
+              <Route path="/" element={<LandingPage />} />
+              <Route path="/login" element={<Login />} />
+              <Route path="/register" element={<Register />} />
+              <Route path="/dashboard" element={<ProtectedRoute><DashboardLayout /></ProtectedRoute>}>
+                <Route index element={<Dashboard />} />
+                <Route path="videos" element={<VideoManager />} />
+                <Route path="live-slot" element={<LiveSlot />} />
+                <Route path="billings" element={<Billings />} />
+                <Route path="support" element={<Support />} />
+              </Route>
+            </Routes>
+            <Toaster position="bottom-right" />
+          </BrowserRouter>
+        </UploadProvider>
       </AuthProvider>
     </div>
   );
