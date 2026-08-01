@@ -768,7 +768,13 @@ async def get_video_thumbnail(video_id: str, user: dict = Depends(get_current_us
                 "-vframes", "1", "-vf", "scale=640:-2", "-q:v", "5", str(thumb_path),
                 stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
             )
-            await asyncio.wait_for(proc.wait(), timeout=8.0)
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=8.0)
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
         except Exception:
             pass
     if not thumb_path.exists():
@@ -1590,7 +1596,8 @@ async def startup_event():
         await db.users.insert_one(admin_doc)
         logger.info(f"Admin user created: {admin_email}")
     else:
-        # Upgrade any existing admin to lifetime + 3 slots
+        # Upgrade any existing admin to lifetime + 3 slots (idempotent).
+        # DO NOT reset password_hash — the user may have changed it via Profile.
         await db.users.update_one(
             {"email": admin_email},
             {"$set": {
@@ -1602,23 +1609,24 @@ async def startup_event():
         )
         logger.info(f"Admin user upgraded to lifetime + 3 slots: {admin_email}")
     
-    # Write test credentials
+    # Write test credentials — only if file doesn't already exist, to preserve
+    # any richer manual notes/setup the operator has documented.
     test_creds_path = Path("/app/memory/test_credentials.md")
     test_creds_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    with open(test_creds_path, "w") as f:
-        f.write("# Live Adda Test Credentials\n\n")
-        f.write("## Admin Account\n")
-        f.write(f"- Email: {admin_email}\n")
-        f.write(f"- Password: {admin_password}\n")
-        f.write(f"- Role: admin\n\n")
-        f.write("## API Endpoints\n")
-        f.write("- POST /api/auth/register\n")
-        f.write("- POST /api/auth/login\n")
-        f.write("- GET /api/auth/me\n")
-        f.write("- POST /api/videos/upload\n")
-        f.write("- GET /api/videos\n")
-        f.write("- POST /api/payments/checkout-session\n")
+    if not test_creds_path.exists():
+        with open(test_creds_path, "w") as f:
+            f.write("# Live Adda Test Credentials\n\n")
+            f.write("## Admin Account\n")
+            f.write(f"- Email: {admin_email}\n")
+            f.write(f"- Password: {admin_password}\n")
+            f.write(f"- Role: admin\n\n")
+            f.write("## API Endpoints\n")
+            f.write("- POST /api/auth/register\n")
+            f.write("- POST /api/auth/login\n")
+            f.write("- GET /api/auth/me\n")
+            f.write("- POST /api/videos/upload\n")
+            f.write("- GET /api/videos\n")
+            f.write("- POST /api/payments/checkout-session\n")
 
 # Include the router in the main app
 app.include_router(api_router)
