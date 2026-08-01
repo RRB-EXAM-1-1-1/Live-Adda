@@ -202,7 +202,11 @@ def _as_utc(dt) -> Optional[datetime]:
 
 def _active_entries(user: dict) -> List[dict]:
     """Return the entries in user['active_plans'] whose expires_at > now.
-    Backward compat: if active_plans is missing, synthesize from legacy plan fields."""
+    Backward compat: if active_plans is missing, synthesize from legacy plan fields.
+    Lifetime (admin) is NOT a stackable entry — it grants a fixed 3 slots via
+    compute_stream_slots — so we return an empty list for lifetime users."""
+    if user.get("plan") == "lifetime":
+        return []
     now = datetime.now(timezone.utc)
     entries = list(user.get("active_plans") or [])
     # Legacy migration on the fly: if the user has legacy plan/plan_expires_at but
