@@ -49,8 +49,8 @@ const VideoManager = () => {
   // finished while the user was on a different page.
   useEffect(() => {
     const off = onComplete(async () => {
-      await loadVideos();
-      await refreshUser();
+      // Refresh both in parallel so the Storage Usage widget updates immediately
+      await Promise.all([loadVideos(), refreshUser()]);
     });
     return off;
   }, [onComplete, refreshUser]);
