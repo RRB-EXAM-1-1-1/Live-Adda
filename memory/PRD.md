@@ -156,3 +156,22 @@ Build "Live Adda" - a professional 24/7 YouTube Live streaming SaaS platform.
   - T3 wipe_all_videos_for_user → 3 videos + files removed, storage=0
   - T4 check_active_plan on all-expired user → stops zombie stream (stopped_reason='all_plans_expired'), wipes videos, raises 403
 
+
+## Iteration 12 (2026-08-01) - Background Video Transcoding / Downscaling
+- USER REQUEST: Auto-downscale uploaded videos: 1080p→720p, 720p→480p, 480p→360p. Below 480p → skip. Runs in the background (non-blocking).
+- NEW BACKEND MODULE (`server.py` top):
+  - `_target_height(source_h)` — pure rule table function: ≥1080→720, ≥720→480, ≥480→360, else None
+  - `transcode_video_background(video_id, user_id, source_path, target_height)` — long-running async coroutine, guarded by `_TRANSCODE_SEM` (Semaphore(1)) so we never run > 1 ffmpeg at once on a 1GB droplet. Uses `libx264 preset veryfast crf 23 aac 128k -movflags +faststart`. Writes to a `.__transcode.tmp` file and atomic-renames on success (safe on Linux even if a stream is reading the old inode). Regenerates the JPEG thumbnail from the transcoded file. Updates the video doc with new `size`, `width`, `height`, `transcoded_to`, `transcoded_at`, `processing_status='completed'` and refunds the user's `storage_used` by (new_size - old_size). On failure, keeps the original file and marks `transcode_error: true` but still flips status to `completed` so the video is streamable.
+  - `schedule_transcode(...)` — fire-and-forget helper; task refs held in `_TRANSCODE_TASKS` set so the GC doesn't kill mid-coroutine.
+- UPLOAD FINALIZE FLOW: After ffprobe extracts height, we call `_target_height`. If a target exists and differs from the source, we flip the video doc to `processing_status='transcoding'` + `transcode_target='<N>p'` + `original_height` + `original_size`, then schedule the background task. Upload response now returns `processing_status` + `transcode_target` fields so the client can react.
+- STARTUP RECOVERY: If backend crashed mid-transcode, all videos left in `processing_status='transcoding'` are inspected on boot. If the file no longer needs downscaling (already ≤ target), flip to `completed`. Otherwise reschedule the transcode. Prevents videos from getting stuck in a permanent "Processing…" state.
+- FRONTEND `VideoManager.jsx`:
+  - New black overlay + spinner + "Processing…" label + "→ 480p" arrow while `processing_status === 'transcoding'` (test id `video-transcoding-{id}`)
+  - Polls `/api/videos` every 5s ONLY while at least one video is transcoding — auto-updates the resolution badge, size, and thumbnail when done. Also refreshes `refreshUser()` so the Storage Usage bar drops in real time.
+- TESTING (direct-call, all pass):
+  - Rule table verified for all boundary inputs (1080/1440/720/480/360/0)
+  - Actual 720p input → produced 854×480 file via ffprobe (real transcode, not a mock)
+  - File shrank 36.8KB → 25.2KB
+  - DB updated (height, width, size, processing_status, transcoded_to='480p')
+  - storage_used counter refunded exactly to the new file size
+

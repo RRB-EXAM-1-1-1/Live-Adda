@@ -76,6 +76,17 @@ const VideoManager = () => {
     return off;
   }, [onComplete, refreshUser]);
 
+  // Poll every 5s while ANY video is transcoding so the UI reflects the
+  // completed state (new size, resolution badge, thumbnail) automatically.
+  useEffect(() => {
+    const hasTranscoding = videos.some(v => v.processing_status === 'transcoding');
+    if (!hasTranscoding) return;
+    const t = setInterval(async () => {
+      await Promise.all([loadVideos(), refreshUser()]);
+    }, 5000);
+    return () => clearInterval(t);
+  }, [videos, refreshUser]);
+
   const loadVideos = async () => {
     setLoading(true);
     const { data } = await videoAPI.getAll();
@@ -270,6 +281,19 @@ const VideoManager = () => {
                     </span>
                   ) : null}
                 </div>
+                {/* Transcoding overlay */}
+                {video.processing_status === 'transcoding' && (
+                  <div
+                    className="absolute inset-0 bg-black/70 flex flex-col items-center justify-center gap-2"
+                    data-testid={`video-transcoding-${video.video_id}`}
+                  >
+                    <div className="w-8 h-8 border-2 border-blue-400 border-t-transparent rounded-full animate-spin" />
+                    <p className="text-white text-xs font-semibold">Processing…</p>
+                    {video.transcode_target && (
+                      <p className="text-blue-300 text-[10px] font-medium">→ {video.transcode_target}</p>
+                    )}
+                  </div>
+                )}
               </div>
 
               {/* Info */}

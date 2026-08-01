@@ -31,6 +31,159 @@ import youtube_service
 # Build SHA is resolved once at first request and cached
 _BUILD_SHA_CACHE = None
 
+# ==================== BACKGROUND VIDEO TRANSCODING ====================
+#
+# Serialized queue: at most 1 transcode at a time so the 1GB droplet doesn't
+# get overwhelmed. Fire-and-forget asyncio tasks are held in _TRANSCODE_TASKS
+# to prevent premature garbage collection.
+_TRANSCODE_SEM = asyncio.Semaphore(1)
+_TRANSCODE_TASKS: set = set()
+
+
+def _target_height(source_height: int) -> Optional[int]:
+    """Rule table:
+      >= 1080p  →  720p
+      >=  720p  →  480p
+      >=  480p  →  360p
+      <   480p  →  skip (return None)
+    """
+    if not source_height or source_height <= 0:
+        return None
+    if source_height >= 1080:
+        return 720
+    if source_height >= 720:
+        return 480
+    if source_height >= 480:
+        return 360
+    return None
+
+
+async def transcode_video_background(video_id: str, user_id: str, source_path: str, target_height: int) -> None:
+    """Transcode a video in-place to `target_height` (H.264 + AAC), atomically
+    replacing the original file when done. Serialized by _TRANSCODE_SEM."""
+    src = Path(source_path)
+    if not src.exists():
+        logger.warning(f"Transcode source missing: {source_path}")
+        await db.videos.update_one(
+            {"video_id": video_id},
+            {"$set": {"processing_status": "completed"}}
+        )
+        return
+
+    tmp_out = src.with_name(f"{src.stem}.__transcode.tmp{src.suffix}")
+
+    async with _TRANSCODE_SEM:
+        # If the video was deleted (stream stopped, plan expired) while we
+        # were waiting for the semaphore, silently skip.
+        if not src.exists() or not await db.videos.find_one({"video_id": video_id, "user_id": user_id}):
+            logger.info(f"Transcode aborted for {video_id} — video no longer exists")
+            return
+
+        logger.info(f"Transcoding {video_id} to {target_height}p (source={src})")
+        old_size = src.stat().st_size
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-y", "-i", str(src),
+                "-vf", f"scale=-2:{target_height}",  # -2 keeps even width for H.264
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                "-c:a", "aac", "-b:a", "128k",
+                "-movflags", "+faststart",
+                str(tmp_out),
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr_bytes = await proc.communicate()
+            if proc.returncode != 0 or not tmp_out.exists() or tmp_out.stat().st_size == 0:
+                logger.error(f"Transcode failed for {video_id}: rc={proc.returncode} stderr={stderr_bytes.decode(errors='ignore')[-300:]}")
+                if tmp_out.exists():
+                    try: tmp_out.unlink()
+                    except Exception: pass
+                # Give up gracefully — keep original file, mark completed
+                await db.videos.update_one(
+                    {"video_id": video_id},
+                    {"$set": {"processing_status": "completed", "transcode_error": True}}
+                )
+                return
+
+            new_size = tmp_out.stat().st_size
+            # Atomic rename: existing readers (a running ffmpeg push) keep
+            # their fd on the old inode, so this is safe on Linux.
+            tmp_out.replace(src)
+
+            # Refresh height metadata (target is our fixed value)
+            new_width = 0
+            try:
+                probe = await asyncio.create_subprocess_exec(
+                    "ffprobe", "-v", "error", "-select_streams", "v:0",
+                    "-show_entries", "stream=width", "-of", "csv=p=0",
+                    str(src),
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+                )
+                w_out, _ = await asyncio.wait_for(probe.communicate(), timeout=4.0)
+                new_width = int(w_out.decode().strip() or 0)
+            except Exception:
+                pass
+
+            # Regenerate the thumbnail from the transcoded file
+            thumb_path = UPLOAD_DIR / "thumbnails" / f"{video_id}.jpg"
+            try:
+                thumb_path.unlink(missing_ok=True)
+                thumb_proc = await asyncio.create_subprocess_exec(
+                    "ffmpeg", "-y", "-ss", "00:00:01", "-i", str(src),
+                    "-vframes", "1", "-vf", "scale=640:-2", "-q:v", "5", str(thumb_path),
+                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                )
+                await asyncio.wait_for(thumb_proc.wait(), timeout=8.0)
+            except Exception:
+                pass
+
+            # Update video doc with new resolution + size
+            await db.videos.update_one(
+                {"video_id": video_id},
+                {"$set": {
+                    "processing_status": "completed",
+                    "size": new_size,
+                    "height": target_height,
+                    "width": new_width,
+                    "transcoded_at": datetime.now(timezone.utc),
+                    "transcoded_to": f"{target_height}p",
+                }}
+            )
+            # Refund the storage delta (transcoded file is smaller)
+            delta = new_size - old_size  # typically negative
+            if delta != 0:
+                await db.users.update_one(
+                    {"user_id": user_id},
+                    {"$inc": {"storage_used": delta}}
+                )
+                await db.users.update_one(
+                    {"user_id": user_id, "storage_used": {"$lt": 0}},
+                    {"$set": {"storage_used": 0}}
+                )
+            logger.info(
+                f"Transcoded {video_id} → {target_height}p: {old_size} → {new_size} bytes "
+                f"(saved {(old_size - new_size) // 1024} KB)"
+            )
+        except Exception as e:
+            logger.exception(f"Unexpected transcode error for {video_id}: {e}")
+            if tmp_out.exists():
+                try: tmp_out.unlink()
+                except Exception: pass
+            await db.videos.update_one(
+                {"video_id": video_id},
+                {"$set": {"processing_status": "completed", "transcode_error": True}}
+            )
+
+
+def schedule_transcode(video_id: str, user_id: str, source_path: str, target_height: int) -> None:
+    """Fire-and-forget scheduler. Task reference held in _TRANSCODE_TASKS so
+    Python's garbage collector doesn't cancel the coroutine mid-run."""
+    task = asyncio.create_task(
+        transcode_video_background(video_id, user_id, source_path, target_height)
+    )
+    _TRANSCODE_TASKS.add(task)
+    task.add_done_callback(_TRANSCODE_TASKS.discard)
+
+
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
@@ -1054,6 +1207,24 @@ async def upload_video_chunk(
     except Exception as e:
         logger.warning(f"ffprobe metadata extraction failed for {video_id}: {e}")
 
+    # ==== Kick off background transcode if resolution qualifies ====
+    target = _target_height(height)
+    processing_status = "completed"
+    if target and target != height:
+        # Mark the doc so the UI can show "Processing…"
+        await db.videos.update_one(
+            {"video_id": video_id},
+            {"$set": {
+                "processing_status": "transcoding",
+                "transcode_target": f"{target}p",
+                "original_height": height,
+                "original_size": file_size,
+            }}
+        )
+        processing_status = "transcoding"
+        schedule_transcode(video_id, user["user_id"], str(final_path), target)
+        logger.info(f"Scheduled transcode for {video_id}: {height}p → {target}p")
+
     return {
         "status": "completed",
         "video_id": video_id,
@@ -1063,6 +1234,8 @@ async def upload_video_chunk(
         "duration_seconds": duration_seconds,
         "width": width,
         "height": height,
+        "processing_status": processing_status,
+        "transcode_target": f"{target}p" if target and target != height else None,
         "thumbnail_url": f"/api/videos/{video_id}/thumbnail",
         "uploaded_at": datetime.now(timezone.utc).isoformat(),
         "message": f"✅ Ready for the stream! Plan validity: {_plan_validity_message(user)}"
@@ -1981,6 +2154,40 @@ async def startup_event():
             {"$set": {"stream_id": new_sid}}
         )
         logger.info(f"Backfilled stream_id={new_sid} on legacy stream for user {legacy.get('user_id')}")
+
+    # Recovery: if backend crashed while a transcode was in-flight, the video
+    # is stuck in processing_status='transcoding' forever. On startup, resume
+    # by re-scheduling any pending transcodes (or mark 'completed' if the file
+    # is already at target resolution).
+    stuck = db.videos.find({"processing_status": "transcoding"})
+    async for v in stuck:
+        vid = v.get("video_id")
+        target = v.get("transcode_target")  # e.g. "720p"
+        fp = v.get("file_path")
+        if not vid or not target or not fp or not Path(fp).exists():
+            await db.videos.update_one(
+                {"video_id": vid},
+                {"$set": {"processing_status": "completed"}}
+            )
+            continue
+        try:
+            target_h = int(str(target).rstrip("p"))
+        except Exception:
+            await db.videos.update_one(
+                {"video_id": vid},
+                {"$set": {"processing_status": "completed"}}
+            )
+            continue
+        # If the file is already at (or below) target, mark done. Otherwise reschedule.
+        current_h = int(v.get("height") or 0)
+        if current_h and current_h <= target_h:
+            await db.videos.update_one(
+                {"video_id": vid},
+                {"$set": {"processing_status": "completed"}}
+            )
+        else:
+            logger.info(f"Resuming interrupted transcode: {vid} → {target}")
+            schedule_transcode(vid, v.get("user_id"), fp, target_h)
 
     # One-time migration: users who had a single legacy `plan`+`plan_expires_at`
     # but no `active_plans` array. Populate the array from the legacy fields so
