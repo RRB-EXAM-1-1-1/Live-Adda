@@ -1531,3 +1531,214 @@ class TestIter7Idempotency:
         db = _get_mongo_db_static()
         rows = list(db.videos.find({"user_id": uid, "upload_id": upload_id}))
         assert len(rows) == 1, f"concurrent finalize created {len(rows)} rows"
+
+
+# ==================== Iteration 8: Admin lifetime + Profile + Thumbnails ====================
+
+class TestIter8AdminLifetime:
+    """Admin now has plan='lifetime', stream_slots=3, plan_expires_at far in future."""
+
+    def test_admin_me_returns_lifetime_and_3_slots(self, admin_session):
+        r = admin_session.get(f"{API}/auth/me", timeout=15)
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert data["plan"] == "lifetime", f"expected plan=lifetime, got {data.get('plan')}"
+        assert data["stream_slots"] == 3, f"expected stream_slots=3, got {data.get('stream_slots')}"
+        assert data.get("role") == "admin", f"expected role=admin, got {data.get('role')}"
+        # plan_expires_at should be far future (>= 50 years out)
+        from datetime import datetime, timezone, timedelta
+        exp_str = data.get("plan_expires_at")
+        assert exp_str is not None
+        exp = datetime.fromisoformat(exp_str.replace("Z", "")).replace(tzinfo=timezone.utc)
+        assert exp > datetime.now(timezone.utc) + timedelta(days=365*50), \
+            f"plan_expires_at not far-future: {exp_str}"
+
+    def test_lifetime_bypasses_plan_expiry_even_if_past(self, admin_session):
+        """Force admin.plan_expires_at into the past — 'lifetime' short-circuit
+        in check_active_plan must still allow the upload/chunk endpoint."""
+        from datetime import datetime, timezone, timedelta
+        me = admin_session.get(f"{API}/auth/me", timeout=15).json()
+        uid = me["user_id"]
+        original_exp = me.get("plan_expires_at")
+        db = _get_mongo_db_static()
+        # Put expiry into the past
+        db.users.update_one({"user_id": uid}, {"$set": {
+            "plan_expires_at": datetime.now(timezone.utc) - timedelta(days=10)
+        }})
+        try:
+            upload_id = uuid.uuid4().hex[:16]
+            payload = b"a" * 200
+            files = {"file": ("lp.mp4", io.BytesIO(payload), "video/mp4")}
+            data = {"upload_id": upload_id, "chunk_index": 0, "total_chunks": 1,
+                    "filename": "lp.mp4", "title": "TEST_iter8_lifetime_bypass", "offset": 0}
+            r = admin_session.post(f"{API}/videos/upload/chunk", files=files, data=data, timeout=60)
+            assert r.status_code == 200, f"lifetime bypass failed: {r.status_code} {r.text}"
+            body = r.json()
+            assert body.get("status") == "completed"
+            admin_session.delete(f"{API}/videos/{body['video_id']}", timeout=15)
+        finally:
+            # Restore original expiry (parse back to datetime)
+            if original_exp:
+                exp = datetime.fromisoformat(original_exp.replace("Z", "")).replace(tzinfo=timezone.utc)
+                db.users.update_one({"user_id": uid}, {"$set": {"plan_expires_at": exp}})
+
+
+class TestIter8ProfileUpdate:
+    """PUT /api/auth/profile - name/email/password updates + validation."""
+
+    def test_update_name(self, admin_session):
+        me0 = admin_session.get(f"{API}/auth/me", timeout=15).json()
+        orig_name = me0["name"]
+        try:
+            r = admin_session.put(f"{API}/auth/profile", json={"name": "New Name"}, timeout=15)
+            assert r.status_code == 200, r.text
+            body = r.json()
+            assert body.get("updated") is True
+            assert "name" in body.get("fields", [])
+            me = admin_session.get(f"{API}/auth/me", timeout=15).json()
+            assert me["name"] == "New Name"
+        finally:
+            admin_session.put(f"{API}/auth/profile", json={"name": orig_name}, timeout=15)
+
+    def test_update_email_then_revert(self, admin_session):
+        me0 = admin_session.get(f"{API}/auth/me", timeout=15).json()
+        orig_email = me0["email"]
+        new_email = f"newadmin_{int(time.time())}@liveadda.org"
+        try:
+            r = admin_session.put(f"{API}/auth/profile", json={"email": new_email}, timeout=15)
+            assert r.status_code == 200, r.text
+            me = admin_session.get(f"{API}/auth/me", timeout=15).json()
+            assert me["email"] == new_email
+        finally:
+            admin_session.put(f"{API}/auth/profile", json={"email": orig_email}, timeout=15)
+
+    def test_change_password_flow_and_revert(self):
+        """Change password → login with new → revert."""
+        s = requests.Session()
+        r = s.post(f"{API}/auth/login", json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD}, timeout=15)
+        assert r.status_code == 200, r.text
+        new_pw = "newSecret123"
+        try:
+            r2 = s.put(f"{API}/auth/profile", json={
+                "current_password": ADMIN_PASSWORD, "new_password": new_pw
+            }, timeout=15)
+            assert r2.status_code == 200, r2.text
+            # Login with new password
+            s2 = requests.Session()
+            r3 = s2.post(f"{API}/auth/login", json={"email": ADMIN_EMAIL, "password": new_pw}, timeout=15)
+            assert r3.status_code == 200, f"login with new password failed: {r3.text}"
+            # Old password must now fail
+            s3 = requests.Session()
+            r4 = s3.post(f"{API}/auth/login", json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD}, timeout=15)
+            assert r4.status_code == 401
+        finally:
+            # Revert (log in with new_pw, change back)
+            s_final = requests.Session()
+            rr = s_final.post(f"{API}/auth/login", json={"email": ADMIN_EMAIL, "password": new_pw}, timeout=15)
+            if rr.status_code == 200:
+                s_final.put(f"{API}/auth/profile", json={
+                    "current_password": new_pw, "new_password": ADMIN_PASSWORD
+                }, timeout=15)
+
+    def test_new_password_without_current_returns_400(self, admin_session):
+        r = admin_session.put(f"{API}/auth/profile",
+                              json={"new_password": "anything123"}, timeout=15)
+        assert r.status_code == 400, r.text
+
+    def test_new_password_too_short_returns_400(self, admin_session):
+        r = admin_session.put(f"{API}/auth/profile", json={
+            "current_password": ADMIN_PASSWORD, "new_password": "abc"
+        }, timeout=15)
+        assert r.status_code == 400, r.text
+
+    def test_wrong_current_password_returns_401(self, admin_session):
+        r = admin_session.put(f"{API}/auth/profile", json={
+            "current_password": "wrong", "new_password": "validPw123"
+        }, timeout=15)
+        assert r.status_code == 401, r.text
+
+
+class TestIter8Thumbnails:
+    """Thumbnail generation + auth + cross-user access."""
+
+    def _upload_tiny_mp4(self, session, title="TEST_iter8_thumb"):
+        """Upload /tmp/tiny.mp4 via chunked endpoint (single chunk)."""
+        import shutil
+        if not shutil.which("ffmpeg"):
+            pytest.skip("ffmpeg not installed")
+        path = "/tmp/tiny.mp4"
+        if not os.path.exists(path):
+            os.system(f"ffmpeg -y -f lavfi -i testsrc=duration=3:size=320x240:rate=15 -pix_fmt yuv420p {path} > /dev/null 2>&1")
+        with open(path, "rb") as f:
+            content = f.read()
+        upload_id = uuid.uuid4().hex[:16]
+        files = {"file": ("tiny.mp4", io.BytesIO(content), "video/mp4")}
+        data = {"upload_id": upload_id, "chunk_index": 0, "total_chunks": 1,
+                "filename": "tiny.mp4", "title": title, "offset": 0}
+        r = session.post(f"{API}/videos/upload/chunk", files=files, data=data, timeout=60)
+        assert r.status_code == 200, r.text
+        return r.json()
+
+    def test_thumbnail_generated_after_upload(self, admin_session):
+        body = self._upload_tiny_mp4(admin_session)
+        vid = body["video_id"]
+        # finalize response should include thumbnail_url
+        assert body.get("thumbnail_url") == f"/api/videos/{vid}/thumbnail", body
+        try:
+            # ffmpeg was up to 8s async — sleep briefly for thumbnail to be ready
+            time.sleep(2)
+            r = admin_session.get(f"{API}/videos/{vid}/thumbnail", timeout=30)
+            assert r.status_code == 200, f"thumbnail fetch failed: {r.status_code} {r.text[:200]}"
+            assert r.headers.get("content-type", "").startswith("image/jpeg"), r.headers
+            assert len(r.content) > 500, f"thumbnail body too small: {len(r.content)}"
+        finally:
+            admin_session.delete(f"{API}/videos/{vid}", timeout=15)
+
+    def test_thumbnail_requires_auth(self, admin_session):
+        body = self._upload_tiny_mp4(admin_session, title="TEST_iter8_thumb_auth")
+        vid = body["video_id"]
+        try:
+            time.sleep(2)
+            r = requests.get(f"{API}/videos/{vid}/thumbnail", timeout=15)
+            assert r.status_code == 401, f"expected 401 unauth, got {r.status_code}"
+        finally:
+            admin_session.delete(f"{API}/videos/{vid}", timeout=15)
+
+    def test_thumbnail_cross_user_returns_404(self, admin_session):
+        # Create a second isolated user with a plan
+        from datetime import datetime, timezone, timedelta
+        s2 = requests.Session()
+        email = f"TEST_iter8_other_{uuid.uuid4().hex[:8]}@example.com"
+        rr = s2.post(f"{API}/auth/register", json={
+            "email": email, "password": "pw123456", "name": "Other"
+        }, timeout=15)
+        assert rr.status_code == 200
+        uid2 = rr.json()["user_id"]
+        db = _get_mongo_db_static()
+        db.users.update_one({"user_id": uid2}, {"$set": {
+            "plan": "daily",
+            "plan_expires_at": datetime.now(timezone.utc) + timedelta(days=1),
+        }})
+        body = self._upload_tiny_mp4(admin_session, title="TEST_iter8_thumb_x")
+        admin_vid = body["video_id"]
+        try:
+            time.sleep(1)
+            r = s2.get(f"{API}/videos/{admin_vid}/thumbnail", timeout=15)
+            assert r.status_code == 404, f"expected 404 for cross-user, got {r.status_code}"
+        finally:
+            admin_session.delete(f"{API}/videos/{admin_vid}", timeout=15)
+            db.users.delete_one({"user_id": uid2})
+
+
+class TestIter8Sitemap:
+    """Static assets: sitemap.xml + robots.txt at app root (served by frontend)."""
+
+    def test_sitemap_reachable(self):
+        r = requests.get(f"{BASE_URL}/sitemap.xml", timeout=15)
+        assert r.status_code == 200, f"{r.status_code}: {r.text[:200]}"
+        assert "<urlset" in r.text or "<sitemapindex" in r.text
+
+    def test_robots_reachable(self):
+        r = requests.get(f"{BASE_URL}/robots.txt", timeout=15)
+        assert r.status_code == 200
+        assert "User-agent" in r.text or "Sitemap" in r.text

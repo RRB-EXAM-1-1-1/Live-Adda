@@ -16,6 +16,27 @@ import { useAuth } from '../contexts/AuthContext';
 import { useUpload } from '../contexts/UploadContext';
 import { toast } from 'sonner';
 
+const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
+
+// Thumbnail that falls back to a Play icon if the JPEG isn't ready yet.
+const VideoThumbnail = ({ videoId, title }) => {
+  const [failed, setFailed] = React.useState(false);
+  const src = `${BACKEND_URL}/api/videos/${videoId}/thumbnail`;
+  if (failed) {
+    return <Play className="w-16 h-16 text-gray-600" data-testid={`video-thumb-fallback-${videoId}`} />;
+  }
+  return (
+    <img
+      src={src}
+      alt={title || 'Video preview'}
+      loading="lazy"
+      onError={() => setFailed(true)}
+      className="w-full h-full object-cover"
+      data-testid={`video-thumb-${videoId}`}
+    />
+  );
+};
+
 const MAX_STORAGE_GB = 2;
 const MAX_STORAGE_BYTES = MAX_STORAGE_GB * 1024 * 1024 * 1024;
 
@@ -228,8 +249,8 @@ const VideoManager = () => {
           {videos.map((video) => (
             <div key={video.video_id} className="bg-gray-800/50 backdrop-blur-lg rounded-2xl overflow-hidden border border-gray-700 hover:border-gray-600 transition-all group">
               {/* Thumbnail */}
-              <div className="relative aspect-video bg-gradient-to-br from-gray-900 to-gray-800 flex items-center justify-center">
-                <Play className="w-16 h-16 text-gray-600" />
+              <div className="relative aspect-video bg-gradient-to-br from-gray-900 to-gray-800 flex items-center justify-center overflow-hidden">
+                <VideoThumbnail videoId={video.video_id} title={video.title} />
                 {video.duration && video.duration !== '00:00' && (
                   <div className="absolute bottom-2 right-2 px-2 py-1 bg-black/80 text-white text-xs rounded">
                     {video.duration}

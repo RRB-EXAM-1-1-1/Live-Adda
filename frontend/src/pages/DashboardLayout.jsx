@@ -9,7 +9,9 @@ import {
   LogOut,
   Menu,
   X,
-  User
+  User,
+  BookOpen,
+  UserCircle
 } from 'lucide-react';
 import { Button } from '../components/ui/button';
 import { useAuth } from '../contexts/AuthContext';
@@ -26,6 +28,12 @@ const DashboardLayout = () => {
     { name: 'Video Manager', path: '/dashboard/videos', icon: Video },
     { name: 'Live Slot', path: '/dashboard/live-slot', icon: RadioIcon },
     { name: 'Billings', path: '/dashboard/billings', icon: CreditCard },
+    { name: 'Profile', path: '/dashboard/profile', icon: UserCircle },
+  ];
+
+  // Sidebar-footer utility links (Tutorial + Support)
+  const footerNav = [
+    { name: 'Tutorial', path: '/dashboard/tutorial', icon: BookOpen },
     { name: 'Support', path: '/dashboard/support', icon: HelpCircle },
   ];
 
@@ -109,11 +117,36 @@ const DashboardLayout = () => {
           </nav>
 
           {/* Logout */}
-          <div className="p-4 border-t border-gray-800">
+          <div className="p-4 border-t border-gray-800 space-y-1">
+            {footerNav.map((item) => {
+              const Icon = item.icon;
+              const active = isActive(item.path);
+              return (
+                <button
+                  key={item.path}
+                  onClick={() => {
+                    navigate(item.path);
+                    setSidebarOpen(false);
+                  }}
+                  data-testid={`sidebar-footer-${item.name.toLowerCase()}`}
+                  className={`
+                    w-full flex items-center space-x-3 px-4 py-2.5 rounded-xl transition-all text-sm
+                    ${active
+                      ? 'bg-gray-800 text-white'
+                      : 'text-gray-400 hover:text-white hover:bg-gray-800'
+                    }
+                  `}
+                >
+                  <Icon className="w-4 h-4" />
+                  <span className="font-medium">{item.name}</span>
+                </button>
+              );
+            })}
             <Button
               onClick={handleLogout}
               variant="ghost"
-              className="w-full justify-start text-gray-400 hover:text-white hover:bg-gray-800"
+              data-testid="sidebar-logout"
+              className="w-full justify-start text-gray-400 hover:text-white hover:bg-gray-800 mt-2"
             >
               <LogOut className="w-5 h-5 mr-3" />
               Logout

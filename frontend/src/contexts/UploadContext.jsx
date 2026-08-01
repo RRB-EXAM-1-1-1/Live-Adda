@@ -16,7 +16,7 @@ import { toast } from 'sonner';
  * has and we resume from that offset.
  */
 
-const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB
+const CHUNK_SIZE = 8 * 1024 * 1024; // 8MB — fewer HTTP round-trips = faster uploads
 const STORAGE_KEY = 'liveadda:pending_upload_v1';
 
 const UploadContext = createContext(null);

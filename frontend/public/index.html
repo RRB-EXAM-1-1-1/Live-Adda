@@ -3,25 +3,87 @@
     <head>
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
-        <meta name="theme-color" content="#000000" />
-        <meta name="description" content="A product of emergent.sh" />
+        <meta name="theme-color" content="#0f172a" />
+
+        <!-- Primary SEO -->
+        <title>Live Adda | Stream Your Videos 24/7 on YouTube Live — No PC Needed</title>
+        <meta name="description" content="Live Adda is the easiest way to stream your videos 24/7 on YouTube Live without a PC or laptop. Upload once, go live nonstop from just ₹35/day. Trusted by Indian creators." />
+        <meta name="keywords" content="Live Adda, LiveAdda, live adda, 24/7 youtube streaming, youtube live 24 hours, non stop youtube live, stream without pc, cloud streaming india, liveadda.org" />
+        <meta name="author" content="Live Adda" />
+        <meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1" />
+        <meta name="google-site-verification" content="REPLACE_WITH_YOUR_GSC_TOKEN" />
+        <link rel="canonical" href="https://liveadda.org/" />
+
+        <!-- Open Graph / social -->
+        <meta property="og:type" content="website" />
+        <meta property="og:site_name" content="Live Adda" />
+        <meta property="og:title" content="Live Adda — Stream 24/7 on YouTube Live, No PC Required" />
+        <meta property="og:description" content="Upload once and stream your videos 24/7 on YouTube from just ₹35/day. Trusted by Indian creators." />
+        <meta property="og:url" content="https://liveadda.org/" />
+        <meta property="og:image" content="https://liveadda.org/og-image.png" />
+        <meta property="og:locale" content="en_IN" />
+        <meta name="twitter:card" content="summary_large_image" />
+        <meta name="twitter:title" content="Live Adda — Stream 24/7 on YouTube Live" />
+        <meta name="twitter:description" content="Upload once and stream your videos 24/7 on YouTube from just ₹35/day." />
+        <meta name="twitter:image" content="https://liveadda.org/og-image.png" />
+
+        <!-- Favicons -->
+        <link rel="icon" type="image/svg+xml" href="%PUBLIC_URL%/favicon.svg" />
+        <link rel="icon" type="image/png" sizes="32x32" href="%PUBLIC_URL%/favicon.svg" />
+        <link rel="apple-touch-icon" href="%PUBLIC_URL%/favicon.svg" />
+        <link rel="shortcut icon" href="%PUBLIC_URL%/favicon.svg" />
+
         <link rel="preconnect" href="https://fonts.googleapis.com" />
         <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
         <link href="https://fonts.googleapis.com/css2?family=Inter:wght@600&display=swap" rel="stylesheet" />
-        <!--
-        manifest.json provides metadata used when your web app is installed on a
-        user's mobile device or desktop. See https://developers.google.com/web/fundamentals/web-app-manifest/
-        -->
-        <!--
-        Notice the use of %PUBLIC_URL% in the tags above.
-        It will be replaced with the URL of the `public` folder during the build.
-        Only files inside the `public` folder can be referenced from the HTML.
 
-        Unlike "/favicon.ico" or "favicon.ico", "%PUBLIC_URL%/favicon.ico" will
-        work correctly both with client-side routing and a non-root public URL.
-        Learn how to configure a non-root public URL by running `npm run build`.
-        -->
-        <title>Live Adda | Stream 24/7 on YouTube</title>
+        <!-- Structured data for Google (rich results, organization + product) -->
+        <script type="application/ld+json">
+        {
+            "@context": "https://schema.org",
+            "@graph": [
+                {
+                    "@type": "Organization",
+                    "@id": "https://liveadda.org/#org",
+                    "name": "Live Adda",
+                    "url": "https://liveadda.org/",
+                    "logo": "https://liveadda.org/favicon.svg",
+                    "contactPoint": [{
+                        "@type": "ContactPoint",
+                        "telephone": "+91-8796533673",
+                        "contactType": "customer support",
+                        "areaServed": "IN",
+                        "availableLanguage": ["en", "hi"]
+                    }]
+                },
+                {
+                    "@type": "WebSite",
+                    "@id": "https://liveadda.org/#website",
+                    "url": "https://liveadda.org/",
+                    "name": "Live Adda",
+                    "description": "Stream Your Videos 24/7 on YouTube Live — No PC Needed",
+                    "publisher": { "@id": "https://liveadda.org/#org" },
+                    "potentialAction": {
+                        "@type": "SearchAction",
+                        "target": "https://liveadda.org/?q={search_term_string}",
+                        "query-input": "required name=search_term_string"
+                    }
+                },
+                {
+                    "@type": "Product",
+                    "name": "Live Adda 24/7 YouTube Streaming",
+                    "brand": { "@type": "Brand", "name": "Live Adda" },
+                    "description": "Cloud service that streams your uploaded videos on YouTube Live 24/7 without needing a PC.",
+                    "offers": [
+                        { "@type": "Offer", "name": "Daily", "price": "35", "priceCurrency": "INR", "availability": "https://schema.org/InStock" },
+                        { "@type": "Offer", "name": "Weekly", "price": "199", "priceCurrency": "INR", "availability": "https://schema.org/InStock" },
+                        { "@type": "Offer", "name": "Monthly", "price": "599", "priceCurrency": "INR", "availability": "https://schema.org/InStock" }
+                    ]
+                }
+            ]
+        }
+        </script>
+
         <script src="https://checkout.razorpay.com/v1/checkout.js"></script>
         <script>window.addEventListener("error",function(e){if(e.error instanceof DOMException&&e.error.name==="DataCloneError"&&e.message&&e.message.includes("PerformanceServerTiming")){e.stopImmediatePropagation();e.preventDefault()}},true);</script>
         <script src="https://assets.emergent.sh/scripts/emergent-main.js"></script>

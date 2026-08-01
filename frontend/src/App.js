@@ -13,6 +13,8 @@ import VideoManager from "./pages/VideoManager";
 import LiveSlot from "./pages/LiveSlot";
 import Billings from "./pages/Billings";
 import Support from "./pages/Support";
+import Profile from "./pages/Profile";
+import Tutorial from "./pages/Tutorial";
 
 function App() {
   return (
@@ -29,6 +31,8 @@ function App() {
                 <Route path="videos" element={<VideoManager />} />
                 <Route path="live-slot" element={<LiveSlot />} />
                 <Route path="billings" element={<Billings />} />
+                <Route path="profile" element={<Profile />} />
+                <Route path="tutorial" element={<Tutorial />} />
                 <Route path="support" element={<Support />} />
               </Route>
             </Routes>

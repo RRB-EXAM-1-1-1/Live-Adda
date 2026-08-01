@@ -13,6 +13,7 @@ from datetime import datetime, timezone, timedelta
 import bcrypt
 import jwt
 import aiofiles
+import asyncio
 # emergentintegrations is optional (Emergent-internal only). Legacy Stripe endpoints
 # degrade gracefully if unavailable. Razorpay is the primary payment path.
 try:
@@ -55,7 +56,10 @@ THUMBNAIL_DIR.mkdir(parents=True, exist_ok=True)
 PLANS = {
     "daily": {"price": 4.99, "inr": 35, "duration_days": 1, "name": "Daily"},
     "weekly": {"price": 24.99, "inr": 199, "duration_days": 7, "name": "Weekly"},
-    "monthly": {"price": 79.99, "inr": 599, "duration_days": 30, "name": "Monthly"}
+    "monthly": {"price": 79.99, "inr": 599, "duration_days": 30, "name": "Monthly"},
+    # Admin/lifetime plan — never expires, 3 concurrent stream slots.
+    # Not sold; assigned manually to admin/staff accounts.
+    "lifetime": {"price": 0, "inr": 0, "duration_days": 36500, "name": "Lifetime (Admin)"}
 }
 
 # Create the main app without a prefix
@@ -176,6 +180,10 @@ async def check_active_plan(user: dict):
             status_code=403,
             detail="⚠️ Please purchase a slot/plan first to proceed."
         )
+    
+    # Lifetime plan bypass — admins/staff never expire
+    if user.get("plan") == "lifetime":
+        return
     
     # Check if plan is expired
     expires_at = user["plan_expires_at"]
@@ -357,8 +365,52 @@ async def get_me(user: dict = Depends(get_current_user)):
         "name": user["name"],
         "plan": user.get("plan"),
         "plan_expires_at": user.get("plan_expires_at").isoformat() if user.get("plan_expires_at") else None,
-        "storage_used": user.get("storage_used", 0)
+        "storage_used": user.get("storage_used", 0),
+        "role": user.get("role"),
+        "stream_slots": user.get("stream_slots", 1),
     }
+
+
+class ProfileUpdate(BaseModel):
+    name: Optional[str] = None
+    email: Optional[EmailStr] = None
+    current_password: Optional[str] = None
+    new_password: Optional[str] = None
+
+
+@api_router.put("/auth/profile")
+async def update_profile(data: ProfileUpdate, user: dict = Depends(get_current_user)):
+    """Update the current user's name, email, and/or password.
+    Password change requires current_password. Email change requires uniqueness."""
+    updates = {}
+
+    if data.name and data.name.strip() and data.name != user["name"]:
+        updates["name"] = data.name.strip()
+
+    if data.email:
+        new_email = data.email.lower()
+        if new_email != user["email"]:
+            clash = await db.users.find_one({"email": new_email, "user_id": {"$ne": user["user_id"]}})
+            if clash:
+                raise HTTPException(status_code=400, detail="This email is already in use.")
+            updates["email"] = new_email
+
+    if data.new_password:
+        if not data.current_password:
+            raise HTTPException(status_code=400, detail="Current password is required to change password.")
+        # Re-load the user WITH password_hash (get_current_user strips it)
+        full_user = await db.users.find_one({"user_id": user["user_id"]})
+        if not full_user or not verify_password(data.current_password, full_user["password_hash"]):
+            raise HTTPException(status_code=401, detail="Current password is incorrect.")
+        if len(data.new_password) < 6:
+            raise HTTPException(status_code=400, detail="New password must be at least 6 characters.")
+        updates["password_hash"] = hash_password(data.new_password)
+
+    if not updates:
+        return {"message": "Nothing to update.", "updated": False}
+
+    await db.users.update_one({"user_id": user["user_id"]}, {"$set": updates})
+    return {"message": "Profile updated successfully.", "updated": True, "fields": list(updates.keys())}
 
 # ==================== VIDEO MANAGEMENT ENDPOINTS ====================
 
@@ -652,11 +704,40 @@ async def upload_video_chunk(
         {"$inc": {"storage_used": file_size}}
     )
 
+    # Generate thumbnail asynchronously (non-blocking) — extracts a JPEG frame
+    # from the video via ffmpeg so the Video Manager can show a preview.
+    try:
+        thumb_dir = UPLOAD_DIR / "thumbnails"
+        thumb_dir.mkdir(parents=True, exist_ok=True)
+        thumb_path = thumb_dir / f"{video_id}.jpg"
+        # Grab a frame at ~1 second, scaled to max width 640. Fast (<1s) for MP4/MOV.
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-ss", "00:00:01", "-i", str(final_path),
+            "-vframes", "1", "-vf", "scale=640:-2", "-q:v", "5", str(thumb_path),
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        # Wait up to 8s; if ffmpeg is slow, keep going without a thumbnail.
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=8.0)
+            if thumb_path.exists() and thumb_path.stat().st_size > 0:
+                await db.videos.update_one(
+                    {"video_id": video_id},
+                    {"$set": {"thumbnail_url": f"/api/videos/{video_id}/thumbnail"}}
+                )
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    except Exception as e:
+        logger.warning(f"Thumbnail generation failed for {video_id}: {e}")
+
     return {
         "status": "completed",
         "video_id": video_id,
         "title": title,
         "size": file_size,
+        "thumbnail_url": f"/api/videos/{video_id}/thumbnail",
         "uploaded_at": datetime.now(timezone.utc).isoformat(),
         "message": f"✅ Ready for the stream! Plan validity: {_plan_validity_message(user)}"
     }
@@ -666,6 +747,33 @@ async def get_videos(user: dict = Depends(get_current_user)):
     """Get all videos for current user"""
     videos = await db.videos.find({"user_id": user["user_id"]}, {"_id": 0}).to_list(1000)
     return videos
+
+
+@api_router.get("/videos/{video_id}/thumbnail")
+async def get_video_thumbnail(video_id: str, user: dict = Depends(get_current_user)):
+    """Serve a JPEG thumbnail for a video the user owns. Lazily generates the
+    thumbnail if it's missing (e.g. for videos uploaded before this feature)."""
+    from fastapi.responses import FileResponse
+    video = await db.videos.find_one({"video_id": video_id, "user_id": user["user_id"]})
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+    thumb_dir = UPLOAD_DIR / "thumbnails"
+    thumb_path = thumb_dir / f"{video_id}.jpg"
+    if not thumb_path.exists():
+        # Try to generate on-the-fly
+        thumb_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-y", "-ss", "00:00:01", "-i", str(video["file_path"]),
+                "-vframes", "1", "-vf", "scale=640:-2", "-q:v", "5", str(thumb_path),
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(proc.wait(), timeout=8.0)
+        except Exception:
+            pass
+    if not thumb_path.exists():
+        raise HTTPException(status_code=404, detail="Thumbnail not available yet")
+    return FileResponse(str(thumb_path), media_type="image/jpeg")
 
 @api_router.put("/videos/{video_id}/rename")
 async def rename_video(
@@ -1459,10 +1567,10 @@ async def startup_event():
     )
     await db.payment_transactions.create_index("session_id")
     
-    # Seed admin user
+    # Seed / re-seed admin user (idempotent — updates existing admin to lifetime + 3 slots)
     admin_email = os.environ.get("ADMIN_EMAIL", "admin@liveadda.com")
     admin_password = os.environ.get("ADMIN_PASSWORD", "admin123")
-    
+
     existing_admin = await db.users.find_one({"email": admin_email})
     if not existing_admin:
         admin_id = f"user_{uuid.uuid4().hex[:12]}"
@@ -1472,13 +1580,27 @@ async def startup_event():
             "name": "Admin",
             "password_hash": hash_password(admin_password),
             "role": "admin",
-            "plan": "monthly",
-            "plan_expires_at": datetime.now(timezone.utc) + timedelta(days=365),
+            "plan": "lifetime",
+            # Set to a far-future date; check_active_plan short-circuits on "lifetime" anyway
+            "plan_expires_at": datetime.now(timezone.utc) + timedelta(days=36500),
+            "stream_slots": 3,
             "storage_used": 0,
             "created_at": datetime.now(timezone.utc)
         }
         await db.users.insert_one(admin_doc)
         logger.info(f"Admin user created: {admin_email}")
+    else:
+        # Upgrade any existing admin to lifetime + 3 slots
+        await db.users.update_one(
+            {"email": admin_email},
+            {"$set": {
+                "role": "admin",
+                "plan": "lifetime",
+                "plan_expires_at": datetime.now(timezone.utc) + timedelta(days=36500),
+                "stream_slots": 3,
+            }}
+        )
+        logger.info(f"Admin user upgraded to lifetime + 3 slots: {admin_email}")
     
     # Write test credentials
     test_creds_path = Path("/app/memory/test_credentials.md")
