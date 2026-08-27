@@ -15,6 +15,7 @@ import Billings from "./pages/Billings";
 import Support from "./pages/Support";
 import Profile from "./pages/Profile";
 import Tutorial from "./pages/Tutorial";
+import AdminDashboard from "./pages/AdminDashboard";
 
 function App() {
   return (
@@ -34,6 +35,7 @@ function App() {
                 <Route path="profile" element={<Profile />} />
                 <Route path="tutorial" element={<Tutorial />} />
                 <Route path="support" element={<Support />} />
+                <Route path="analytics" element={<AdminDashboard />} />
               </Route>
             </Routes>
             <Toaster position="bottom-right" />

@@ -13,6 +13,7 @@ const Profile = () => {
   const [form, setForm] = useState({
     name: user?.name || '',
     email: user?.email || '',
+    mobile_number: user?.mobile_number || '',
     current_password: '',
     new_password: '',
     confirm_password: '',
@@ -31,6 +32,7 @@ const Profile = () => {
       const payload = {};
       if (form.name && form.name !== user.name) payload.name = form.name;
       if (form.email && form.email !== user.email) payload.email = form.email;
+      if ((form.mobile_number || '') !== (user.mobile_number || '')) payload.mobile_number = form.mobile_number;
       if (form.new_password) {
         payload.current_password = form.current_password;
         payload.new_password = form.new_password;
@@ -107,6 +109,18 @@ const Profile = () => {
             className="mt-1 bg-gray-700/50 border-gray-600 text-white"
             data-testid="profile-email-input"
           />
+        </div>
+
+        <div>
+          <Label htmlFor="mobile_number" className="text-gray-300">Mobile Number (WhatsApp / SMS)</Label>
+          <Input
+            id="mobile_number" type="tel" value={form.mobile_number}
+            onChange={(e) => setForm({ ...form, mobile_number: e.target.value })}
+            className="mt-1 bg-gray-700/50 border-gray-600 text-white"
+            placeholder="+91 98765 43210"
+            data-testid="profile-mobile-input"
+          />
+          <p className="text-gray-500 text-xs mt-1">Used by support so we can reach you if a stream fails.</p>
         </div>
 
         <div className="pt-4 border-t border-gray-700">

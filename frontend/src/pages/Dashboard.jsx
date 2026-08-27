@@ -1,9 +1,10 @@
 import React, { useState, useEffect } from 'react';
-import { Activity, DollarSign, Radio, Video, TrendingUp, Clock, AlertTriangle } from 'lucide-react';
+import { Activity, DollarSign, Radio, Video, TrendingUp, Clock, AlertTriangle, Users, BarChart3, MessageSquare } from 'lucide-react';
 import { Button } from '../components/ui/button';
 import { useNavigate } from 'react-router-dom';
 import { dashboardAPI } from '../services/api';
 import { useAuth } from '../contexts/AuthContext';
+import api from '../services/api';
 
 const formatBytes = (bytes) => {
   if (!bytes || bytes === 0) return '0 MB';
@@ -17,6 +18,8 @@ const Dashboard = () => {
   const { user, refreshUser } = useAuth();
   const [stats, setStats] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [adminSummary, setAdminSummary] = useState(null);
+  const isAdmin = user?.role === 'admin' || user?.plan === 'lifetime';
 
   // Use fresh DB stats as the source of truth (falls back to auth context).
   const planId = stats?.plan ?? user?.plan;
@@ -27,7 +30,12 @@ const Dashboard = () => {
     loadStats();
     // Keep the app-wide auth context in sync with the DB (e.g. after a purchase)
     refreshUser();
-  }, []);
+    if (isAdmin) {
+      (async () => {
+        try { const { data } = await api.get('/admin/summary'); setAdminSummary(data); } catch {}
+      })();
+    }
+  }, [isAdmin]);
 
   const loadStats = async () => {
     setLoading(true);
@@ -86,7 +94,7 @@ const Dashboard = () => {
       </div>
 
       {/* No Plan Warning */}
-      {!hasActivePlan && (
+      {!hasActivePlan && !isAdmin && (
         <div className="bg-amber-500/10 border border-amber-500/30 rounded-2xl p-6" data-testid="no-plan-warning">
           <div className="flex items-center justify-between">
             <div className="flex items-center space-x-3">
@@ -103,6 +111,50 @@ const Dashboard = () => {
             >
               View Plans
             </Button>
+          </div>
+        </div>
+      )}
+
+      {/* Admin Summary Strip — only shown to admins on their dashboard home */}
+      {isAdmin && adminSummary && (
+        <div
+          className="bg-gradient-to-br from-blue-500/10 to-purple-500/10 border border-blue-500/30 rounded-2xl p-6"
+          data-testid="admin-home-summary"
+        >
+          <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-xl bg-blue-500/20 flex items-center justify-center">
+                <BarChart3 className="w-5 h-5 text-blue-300" />
+              </div>
+              <div>
+                <h3 className="text-white font-bold">Admin snapshot</h3>
+                <p className="text-gray-400 text-xs">Live counters · refresh every 15s in Analytics</p>
+              </div>
+            </div>
+            <Button size="sm" onClick={() => navigate('/dashboard/analytics')}
+              data-testid="admin-open-analytics"
+              className="bg-blue-500 hover:bg-blue-600 text-white">
+              Open Analytics →
+            </Button>
+          </div>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+            {[
+              { icon: Radio,    label: 'Live now',        value: adminSummary.live_users,          tone: 'text-red-400' },
+              { icon: Users,    label: 'Total users',     value: adminSummary.total_users,         tone: 'text-blue-300' },
+              { icon: Users,    label: 'Sign-ups today',  value: adminSummary.signups_today,       tone: 'text-purple-300' },
+              { icon: MessageSquare, label: 'Open tickets', value: adminSummary.open_tickets,      tone: 'text-amber-300' },
+            ].map((s, i) => {
+              const Ic = s.icon;
+              return (
+                <div key={i} className="bg-black/20 rounded-xl p-3">
+                  <div className="flex items-center gap-2 mb-1">
+                    <Ic className={`w-4 h-4 ${s.tone}`} />
+                    <span className="text-gray-400 text-xs uppercase font-semibold">{s.label}</span>
+                  </div>
+                  <p className="text-2xl font-bold text-white">{s.value}</p>
+                </div>
+              );
+            })}
           </div>
         </div>
       )}

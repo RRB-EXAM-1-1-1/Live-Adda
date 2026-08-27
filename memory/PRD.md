@@ -175,3 +175,37 @@ Build "Live Adda" - a professional 24/7 YouTube Live streaming SaaS platform.
   - DB updated (height, width, size, processing_status, transcoded_to='480p')
   - storage_used counter refunded exactly to the new file size
 
+
+## Iteration 13 (2026-08-01) - Admin Analytics Dashboard (Comprehensive)
+- USER REQUEST: Full admin dashboard — sidebar Analytics link + home summary cards, live-user counter, live streams table with per-stream Stop, support ticket visibility & reply, user history browser, system health monitor, broadcast tool.
+- BACKEND ENDPOINTS added (all guarded by `get_admin_user` dependency — 403 if not admin/lifetime):
+  - `GET /api/admin/summary` — total_users, live_users, live_streams, signups_today/week, active_paying_users, open_tickets, total_videos
+  - `GET /api/admin/system` — psutil CPU/RAM/disk + load avg + build_sha
+  - `GET /api/admin/live-users` — enriched rows: user email/mobile/plan + plan start & expiry + video title/size/resolution + stream_id
+  - `POST /api/admin/stream/{stream_id}/stop` — force-stop with `stopped_reason='admin_force_stop'` and `stopped_by_admin`
+  - `GET /api/admin/tickets?status=open|closed` — lists all support tickets, joined with user contact info (fixes the "tickets invisible" bug — 9 pre-existing tickets now surface)
+  - `POST /api/admin/tickets/{ticket_id}/reply` — append reply, optionally close
+  - `GET /api/admin/users?q=email_substring` — paginated user browser
+  - `GET /api/admin/users/{user_id}/history` — full history (user profile + transactions + streams + videos)
+  - `POST /api/admin/broadcast` — create announcement targeted at all/active_plan/live_only
+  - `GET /api/admin/broadcasts` — list all sent broadcasts
+  - `DELETE /api/admin/broadcast/{id}` — hard-delete broadcast
+  - `GET /api/notifications` — user-side fetch of active broadcasts (audience-filtered)
+- SCHEMA additions:
+  - `users.mobile_number` (optional string) — editable via Profile page, shown in admin tables
+  - `notifications` collection — {notification_id, title, body, audience, severity, created_by, created_at, active}
+- DEPENDENCY: `psutil==7.2.2` added to backend/requirements.txt for the system monitor.
+- FRONTEND `AdminDashboard.jsx` (single tabbed page at `/dashboard/analytics`):
+  - Tab strip: Overview / Live Users / Tickets (with red badge counter) / Users / Broadcast
+  - Overview: 8 stat cards + System panel with CPU/RAM/Disk progress bars (auto-color: red when >80%)
+  - Live Users: full table with email/mobile/plan/start/expiry/video/size/resolution + force-Stop button
+  - Tickets: list with subject/message/status pill; reply dialog with Send + Send&Close
+  - Users: email-substring search + table + "History" opens dialog with active_plans, transactions, streams, videos
+  - Broadcast: send new announcement (title/body/audience/severity) + list of past broadcasts with delete
+  - Auto-polls /admin/{summary,system,live-users} every 15s for real-time counters
+- FRONTEND `Dashboard.jsx` home page (per user requirement #1): admin-only "Admin snapshot" gradient card at top with 4 mini-stats (Live now, Total users, Sign-ups today, Open tickets) + "Open Analytics →" button
+- FRONTEND `NotificationBanner.jsx` component + integrated into `DashboardLayout` — shows active broadcasts at top of every dashboard page, dismissible per-user (localStorage), audience-aware
+- FRONTEND `Profile.jsx` — new Mobile Number field (WhatsApp/SMS) sent to `/api/auth/profile` and stored on user doc
+- FRONTEND sidebar — Admin sees "Analytics" nav item (conditional on `role==='admin' || plan==='lifetime'`)
+- VERIFIED via direct curl + Playwright: /admin/summary returns 56 users + 9 open tickets, /admin/system returns real CPU 7.9% RAM 48.4% Disk 15.7%, admin-dashboard renders all 5 tabs, 9 tickets surface in Tickets tab with badge, sidebar Analytics link visible, admin-home-summary card renders on Dashboard home.
+

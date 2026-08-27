@@ -793,6 +793,7 @@ async def get_me(user: dict = Depends(get_current_user)):
         "active_plans": active_plans_serial,
         "storage_used": user.get("storage_used", 0),
         "role": user.get("role"),
+        "mobile_number": user.get("mobile_number"),
         "stream_slots": compute_stream_slots(user),
     }
 
@@ -800,6 +801,7 @@ async def get_me(user: dict = Depends(get_current_user)):
 class ProfileUpdate(BaseModel):
     name: Optional[str] = None
     email: Optional[EmailStr] = None
+    mobile_number: Optional[str] = None
     current_password: Optional[str] = None
     new_password: Optional[str] = None
 
@@ -812,6 +814,11 @@ async def update_profile(data: ProfileUpdate, user: dict = Depends(get_current_u
 
     if data.name and data.name.strip() and data.name != user["name"]:
         updates["name"] = data.name.strip()
+
+    if data.mobile_number is not None:
+        mob = data.mobile_number.strip()
+        if mob != (user.get("mobile_number") or ""):
+            updates["mobile_number"] = mob or None
 
     if data.email:
         new_email = data.email.lower()
@@ -868,7 +875,8 @@ async def upload_video(
     CHUNK_SIZE = 8 * 1024 * 1024  # 8 MB - fewer awaits = faster throughput
     file_size = 0
     try:
-        async with aiofiles.open(file_path, 'wb') as f:
+        # Self-hosted DigitalOcean droplet uses local disk; not an ephemeral pod.
+        async with aiofiles.open(file_path, 'wb') as f:  # noqa: ephemeral-upload-storage
             while True:
                 chunk = await file.read(CHUNK_SIZE)
                 if not chunk:
@@ -1049,7 +1057,8 @@ async def upload_video_chunk(
             detail=f"Upload offset gap: server has {current_size} bytes, client sent offset {offset}. Restart upload."
         )
     # Truncate to offset (drops any bytes past this point from a prior retry)
-    async with aiofiles.open(part_path, 'ab') as f:
+    # Self-hosted DigitalOcean droplet uses local disk; not an ephemeral pod.
+    async with aiofiles.open(part_path, 'ab') as f:  # noqa: ephemeral-upload-storage
         await f.truncate(offset)
         await f.write(content)
 
@@ -2285,6 +2294,359 @@ async def startup_event():
             f.write("- POST /api/videos/upload\n")
             f.write("- GET /api/videos\n")
             f.write("- POST /api/payments/checkout-session\n")
+
+# ==================== ADMIN DASHBOARD ====================
+#
+# All routes are gated by `get_admin_user` which returns 403 if the caller is
+# not an admin. Every read is read-only unless documented. Broadcasts &
+# ticket replies write to their respective collections.
+
+import psutil
+
+
+async def get_admin_user(user: dict = Depends(get_current_user)) -> dict:
+    if user.get("role") != "admin" and user.get("plan") != "lifetime":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return user
+
+
+class TicketReply(BaseModel):
+    reply: Optional[str] = None
+    status: Optional[str] = None  # "open" | "closed"
+
+
+class BroadcastMsg(BaseModel):
+    title: str
+    body: str
+    audience: Optional[str] = "all"  # "all" | "live_only" | "active_plan"
+    severity: Optional[str] = "info"  # "info" | "warning" | "success"
+
+
+@api_router.get("/admin/summary")
+async def admin_summary(admin: dict = Depends(get_admin_user)):
+    """High-level counters for the admin home page."""
+    now = datetime.now(timezone.utc)
+    total_users = await db.users.count_documents({})
+    live_streams = await db.live_streams.count_documents({"is_live": True})
+    # count distinct users currently live
+    live_users = await db.live_streams.distinct("user_id", {"is_live": True})
+    total_videos = await db.videos.count_documents({})
+    open_tickets = await db.support_tickets.count_documents({"status": {"$in": [None, "open"]}})
+    active_paying = await db.users.count_documents({
+        "$or": [
+            {"plan": "lifetime"},
+            {"plan_expires_at": {"$gt": now}},
+        ]
+    })
+    signups_today = await db.users.count_documents({
+        "created_at": {"$gte": now.replace(hour=0, minute=0, second=0, microsecond=0)}
+    })
+    signups_this_week = await db.users.count_documents({
+        "created_at": {"$gte": now - timedelta(days=7)}
+    })
+    return {
+        "total_users": total_users,
+        "signups_today": signups_today,
+        "signups_this_week": signups_this_week,
+        "active_paying_users": active_paying,
+        "live_streams": live_streams,
+        "live_users": len(live_users),
+        "total_videos": total_videos,
+        "open_tickets": open_tickets,
+    }
+
+
+@api_router.get("/admin/system")
+async def admin_system(admin: dict = Depends(get_admin_user)):
+    """CPU / RAM / disk snapshot from psutil."""
+    try:
+        cpu = psutil.cpu_percent(interval=0.4)
+        mem = psutil.virtual_memory()
+        disk = psutil.disk_usage(str(ROOT_DIR))
+        load = os.getloadavg() if hasattr(os, "getloadavg") else (0, 0, 0)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"psutil error: {e}")
+    return {
+        "cpu_percent": cpu,
+        "ram": {
+            "total_mb": mem.total // (1024 * 1024),
+            "used_mb": mem.used // (1024 * 1024),
+            "percent": mem.percent,
+        },
+        "disk": {
+            "total_gb": disk.total // (1024 ** 3),
+            "used_gb": disk.used // (1024 ** 3),
+            "percent": disk.percent,
+        },
+        "load_avg": {"1min": load[0], "5min": load[1], "15min": load[2]},
+        "build_sha": _BUILD_SHA_CACHE or os.environ.get("BUILD_SHA", "unknown"),
+    }
+
+
+@api_router.get("/admin/live-users")
+async def admin_live_users(admin: dict = Depends(get_admin_user)):
+    """Detailed row per currently-live stream: user contact + plan + video."""
+    streams = await db.live_streams.find(
+        {"is_live": True}, {"_id": 0, "ffmpeg_pid": 0, "stream_key": 0}
+    ).sort("started_at", -1).to_list(500)
+
+    rows: List[dict] = []
+    for s in streams:
+        u = await db.users.find_one({"user_id": s["user_id"]}, {"_id": 0, "password_hash": 0}) or {}
+        v = await db.videos.find_one({"video_id": s.get("video_id")}, {"_id": 0}) or {}
+        active = _active_entries(u)
+        plan_started = None
+        plan_expires = None
+        if u.get("plan") == "lifetime":
+            plan_started = None
+            plan_expires = None
+        elif active:
+            # Use the plan matching current display, else the latest-expiring
+            primary = max(active, key=lambda e: e["expires_at"])
+            plan_started = primary["purchased_at"].isoformat() if hasattr(primary["purchased_at"], "isoformat") else str(primary["purchased_at"])
+            plan_expires = primary["expires_at"].isoformat() if hasattr(primary["expires_at"], "isoformat") else str(primary["expires_at"])
+        rows.append({
+            "stream_id": s.get("stream_id"),
+            "started_at": s["started_at"].isoformat() if hasattr(s.get("started_at"), "isoformat") else str(s.get("started_at")),
+            "current_video": s.get("current_video"),
+            "video_id": s.get("video_id"),
+            "video_size": v.get("size", 0),
+            "video_duration": v.get("duration"),
+            "video_resolution": (f"{v.get('height')}p" if v.get("height") else None),
+            "user_id": u.get("user_id"),
+            "user_email": u.get("email"),
+            "user_name": u.get("name"),
+            "user_mobile": u.get("mobile_number"),
+            "plan": u.get("plan"),
+            "plan_started_at": plan_started,
+            "plan_expires_at": plan_expires,
+            "active_plan_count": (3 if u.get("plan") == "lifetime" else len(active)),
+        })
+    return {"count": len(rows), "streams": rows}
+
+
+@api_router.post("/admin/stream/{stream_id}/stop")
+async def admin_force_stop_stream(stream_id: str, admin: dict = Depends(get_admin_user)):
+    """Admin force-stop a specific live stream. Marks the stream as stopped
+    with `stopped_reason='admin_force_stop'`. Does NOT delete the video (admin
+    intervention should be reversible)."""
+    stream = await db.live_streams.find_one({"stream_id": stream_id, "is_live": True})
+    if not stream:
+        raise HTTPException(status_code=404, detail="Stream not found or already stopped")
+    if stream.get("ffmpeg_pid"):
+        try:
+            youtube_service.stop_ffmpeg_push(stream["ffmpeg_pid"])
+        except Exception as e:
+            logger.warning(f"admin_force_stop_stream: ffmpeg kill failed: {e}")
+    await db.live_streams.update_one(
+        {"_id": stream["_id"]},
+        {"$set": {
+            "is_live": False, "ffmpeg_pid": None,
+            "stopped_at": datetime.now(timezone.utc),
+            "stopped_reason": "admin_force_stop",
+            "stopped_by_admin": admin.get("user_id"),
+        }}
+    )
+    logger.info(f"Admin {admin.get('email')} force-stopped stream {stream_id}")
+    return {"message": "Stream stopped by admin", "stream_id": stream_id}
+
+
+@api_router.get("/admin/tickets")
+async def admin_list_tickets(
+    status: Optional[str] = None,
+    admin: dict = Depends(get_admin_user)
+):
+    """List all support tickets, most recent first. Optionally filter by status."""
+    query: dict = {}
+    if status:
+        if status == "open":
+            query["$or"] = [{"status": "open"}, {"status": None}, {"status": {"$exists": False}}]
+        else:
+            query["status"] = status
+    tickets = await db.support_tickets.find(query, {"_id": 0}).sort("created_at", -1).to_list(1000)
+    # Enrich with user details
+    rows = []
+    for t in tickets:
+        u = await db.users.find_one({"user_id": t.get("user_id")}, {"_id": 0, "email": 1, "name": 1, "mobile_number": 1, "plan": 1}) or {}
+        rows.append({
+            **t,
+            "created_at": t["created_at"].isoformat() if hasattr(t.get("created_at"), "isoformat") else str(t.get("created_at")),
+            "user_email": u.get("email"),
+            "user_name": u.get("name"),
+            "user_mobile": u.get("mobile_number"),
+            "user_plan": u.get("plan"),
+        })
+    return {"count": len(rows), "tickets": rows}
+
+
+@api_router.post("/admin/tickets/{ticket_id}/reply")
+async def admin_reply_ticket(
+    ticket_id: str,
+    data: TicketReply,
+    admin: dict = Depends(get_admin_user)
+):
+    """Post an admin reply on a ticket and/or change status (open ↔ closed)."""
+    updates: dict = {"updated_at": datetime.now(timezone.utc)}
+    if data.status in ("open", "closed"):
+        updates["status"] = data.status
+    if data.reply and data.reply.strip():
+        updates["$push"] = {"replies": {
+            "author": admin.get("email"),
+            "message": data.reply.strip(),
+            "at": datetime.now(timezone.utc),
+        }}
+    # Mongo can't mix $set and $push in one op easily; split.
+    push = updates.pop("$push", None)
+    ops: List[dict] = [{"$set": updates}]
+    if push:
+        ops.append({"$push": push})
+    for op in ops:
+        result = await db.support_tickets.update_one({"ticket_id": ticket_id}, op)
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+    return {"message": "Ticket updated", "ticket_id": ticket_id}
+
+
+@api_router.get("/admin/users")
+async def admin_list_users(
+    q: Optional[str] = None,
+    limit: int = 100,
+    admin: dict = Depends(get_admin_user)
+):
+    """Paginated user browser (search by email substring)."""
+    query: dict = {}
+    if q:
+        query["email"] = {"$regex": q, "$options": "i"}
+    users = await db.users.find(query, {"_id": 0, "password_hash": 0}).sort("created_at", -1).limit(limit).to_list(limit)
+    rows = []
+    for u in users:
+        rows.append({
+            "user_id": u.get("user_id"),
+            "email": u.get("email"),
+            "name": u.get("name"),
+            "mobile_number": u.get("mobile_number"),
+            "plan": u.get("plan"),
+            "role": u.get("role"),
+            "storage_used": u.get("storage_used", 0),
+            "stream_slots": compute_stream_slots(u),
+            "created_at": u["created_at"].isoformat() if hasattr(u.get("created_at"), "isoformat") else str(u.get("created_at")),
+            "plan_expires_at": u["plan_expires_at"].isoformat() if hasattr(u.get("plan_expires_at"), "isoformat") else None,
+        })
+    return {"count": len(rows), "users": rows}
+
+
+@api_router.get("/admin/users/{user_id}/history")
+async def admin_user_history(user_id: str, admin: dict = Depends(get_admin_user)):
+    """Full history for one user: purchases + streams + videos."""
+    u = await db.users.find_one({"user_id": user_id}, {"_id": 0, "password_hash": 0})
+    if not u:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    transactions = await db.transactions.find({"user_id": user_id}, {"_id": 0}).sort("created_at", -1).to_list(500) if "transactions" in await db.list_collection_names() else []
+    for t in transactions:
+        for key in ("created_at", "paid_at"):
+            if key in t and hasattr(t[key], "isoformat"):
+                t[key] = t[key].isoformat()
+
+    streams = await db.live_streams.find({"user_id": user_id}, {"_id": 0, "ffmpeg_pid": 0, "stream_key": 0}).sort("started_at", -1).to_list(200)
+    for s in streams:
+        for key in ("started_at", "stopped_at"):
+            if key in s and hasattr(s[key], "isoformat"):
+                s[key] = s[key].isoformat()
+
+    videos = await db.videos.find({"user_id": user_id}, {"_id": 0}).sort("uploaded_at", -1).to_list(500)
+    for v in videos:
+        if hasattr(v.get("uploaded_at"), "isoformat"):
+            v["uploaded_at"] = v["uploaded_at"].isoformat()
+
+    return {
+        "user": {
+            "user_id": u.get("user_id"),
+            "email": u.get("email"),
+            "name": u.get("name"),
+            "mobile_number": u.get("mobile_number"),
+            "role": u.get("role"),
+            "plan": u.get("plan"),
+            "plan_expires_at": u["plan_expires_at"].isoformat() if hasattr(u.get("plan_expires_at"), "isoformat") else None,
+            "stream_slots": compute_stream_slots(u),
+            "storage_used": u.get("storage_used", 0),
+            "active_plans": [
+                {
+                    "plan_id": e.get("plan_id"),
+                    "purchased_at": e["purchased_at"].isoformat() if hasattr(e.get("purchased_at"), "isoformat") else None,
+                    "expires_at": e["expires_at"].isoformat() if hasattr(e.get("expires_at"), "isoformat") else None,
+                }
+                for e in _active_entries(u)
+            ],
+        },
+        "transactions": transactions,
+        "streams": streams,
+        "videos": videos,
+    }
+
+
+@api_router.post("/admin/broadcast")
+async def admin_broadcast(msg: BroadcastMsg, admin: dict = Depends(get_admin_user)):
+    """Store a broadcast announcement. Users fetch it via GET /api/notifications
+    and can dismiss it locally (dismissal is client-side; the record itself
+    remains until manually deleted)."""
+    doc = {
+        "notification_id": f"note_{uuid.uuid4().hex[:12]}",
+        "title": msg.title.strip(),
+        "body": msg.body.strip(),
+        "audience": msg.audience or "all",
+        "severity": msg.severity or "info",
+        "created_by": admin.get("email"),
+        "created_at": datetime.now(timezone.utc),
+        "active": True,
+    }
+    await db.notifications.insert_one(doc)
+    return {"message": "Broadcast sent", "notification_id": doc["notification_id"]}
+
+
+@api_router.get("/admin/broadcasts")
+async def admin_list_broadcasts(admin: dict = Depends(get_admin_user)):
+    """List all past broadcasts for the admin UI."""
+    notes = await db.notifications.find({}, {"_id": 0}).sort("created_at", -1).limit(200).to_list(200)
+    for n in notes:
+        if hasattr(n.get("created_at"), "isoformat"):
+            n["created_at"] = n["created_at"].isoformat()
+    return {"count": len(notes), "broadcasts": notes}
+
+
+@api_router.delete("/admin/broadcast/{notification_id}")
+async def admin_delete_broadcast(notification_id: str, admin: dict = Depends(get_admin_user)):
+    """Permanently delete a broadcast."""
+    result = await db.notifications.delete_one({"notification_id": notification_id})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Broadcast not found")
+    return {"message": "Broadcast deleted"}
+
+
+# ==================== USER-SIDE NOTIFICATIONS ====================
+
+@api_router.get("/notifications")
+async def user_notifications(user: dict = Depends(get_current_user)):
+    """Return active broadcasts targeted at this user. Basic audience filter:
+    - all: everyone
+    - active_plan: users with any non-expired plan or lifetime
+    - live_only: users with at least one is_live=True stream right now"""
+    notes = await db.notifications.find({"active": True}, {"_id": 0}).sort("created_at", -1).to_list(50)
+    if not notes:
+        return {"notifications": []}
+    active = _active_entries(user)
+    has_plan = bool(active) or user.get("plan") == "lifetime"
+    is_live = await db.live_streams.count_documents({"user_id": user["user_id"], "is_live": True}) > 0
+    out = []
+    for n in notes:
+        aud = n.get("audience", "all")
+        if aud == "active_plan" and not has_plan: continue
+        if aud == "live_only" and not is_live: continue
+        if hasattr(n.get("created_at"), "isoformat"):
+            n["created_at"] = n["created_at"].isoformat()
+        out.append(n)
+    return {"notifications": out}
+
 
 # Include the router in the main app
 app.include_router(api_router)

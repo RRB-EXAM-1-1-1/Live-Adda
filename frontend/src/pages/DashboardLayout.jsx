@@ -11,12 +11,14 @@ import {
   X,
   User,
   BookOpen,
-  UserCircle
+  UserCircle,
+  BarChart3
 } from 'lucide-react';
 import { Button } from '../components/ui/button';
 import { useAuth } from '../contexts/AuthContext';
 import GlobalUploadIndicator from '../components/GlobalUploadIndicator';
 import DashboardErrorBoundary from '../components/DashboardErrorBoundary';
+import NotificationBanner from '../components/NotificationBanner';
 
 const DashboardLayout = () => {
   const navigate = useNavigate();
@@ -24,12 +26,15 @@ const DashboardLayout = () => {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const { user, logout } = useAuth();
 
+  const isAdmin = user?.role === 'admin' || user?.plan === 'lifetime';
+
   const navigation = [
     { name: 'Dashboard', path: '/dashboard', icon: LayoutDashboard },
     { name: 'Video Manager', path: '/dashboard/videos', icon: Video },
     { name: 'Live Slot', path: '/dashboard/live-slot', icon: RadioIcon },
     { name: 'Billings', path: '/dashboard/billings', icon: CreditCard },
     { name: 'Profile', path: '/dashboard/profile', icon: UserCircle },
+    ...(isAdmin ? [{ name: 'Analytics', path: '/dashboard/analytics', icon: BarChart3 }] : []),
   ];
 
   // Sidebar-footer utility links (Tutorial + Support)
@@ -159,6 +164,7 @@ const DashboardLayout = () => {
       {/* Main Content */}
       <main className="lg:ml-64 min-h-screen">
         <div className="p-6 lg:p-8 pt-20 lg:pt-8">
+          <NotificationBanner />
           <DashboardErrorBoundary>
             <Outlet />
           </DashboardErrorBoundary>
