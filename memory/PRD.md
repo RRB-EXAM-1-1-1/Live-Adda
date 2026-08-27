@@ -211,6 +211,13 @@ Build "Live Adda" - a professional 24/7 YouTube Live streaming SaaS platform.
 
 
 
+## Instant CPU Cleanup on Stream/Plan End (2026-07)
+Previously the "stop ffmpeg" logic only fired when the user hit an API. If someone paid for a Daily plan, started a stream, then closed their browser, the encoder kept burning ~100% CPU past hour 24 because nothing was calling `check_active_plan`. Added:
+- **Reaper loop (every 15 s)** — catches ffmpeg that died on its own, marks DB row `is_live=False, stopped_reason="ffmpeg_exited"`.
+- **Plan-expiry sweeper (every 30 s)** — scans `live_streams` where `is_live=True`, checks the owner's `active_plans` server-side, and kills any ffmpeg whose owner has no non-expired plans (`stopped_reason="plan_expired_sweep"`) or has more streams than slots (`stopped_reason="slot_shrink_sweep"`). Runs regardless of whether the user is online.
+- Both loops share the improved `stop_ffmpeg_push` (SIGTERM process group → 5 s wait → SIGKILL → reap) so CPU drops immediately when the sweeper fires.
+- Worst-case latency between "plan expires" and "CPU freed" is now ≤30 s (one sweeper cycle), down from "until the user opens the app again" (unbounded).
+
 ## FFmpeg CPU Optimizations (2026-07)
 For the 2 vCPU / 4 GB DigitalOcean droplet the user runs in production:
 - **Preset**: re-encode path switched from `-preset veryfast` → `-preset ultrafast -tune zerolatency`.

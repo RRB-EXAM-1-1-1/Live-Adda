@@ -2321,6 +2321,88 @@ async def startup_event():
 
     asyncio.create_task(_ffmpeg_reaper_loop())
 
+    # Proactive expiry sweeper: kills ffmpeg processes for users whose plan
+    # has expired or whose live stream count now exceeds their slot count.
+    # Without this, an idle user who paid for a Daily plan and closed the
+    # browser would keep an ffmpeg encoder pegged at 100% CPU well past their
+    # 24-hour window — because check_active_plan / sync_user_plans_and_enforce_slots
+    # only run when the user hits an authenticated API.
+    async def _plan_expiry_sweep_loop():
+        while True:
+            try:
+                now = datetime.now(timezone.utc)
+                # Group live streams by user so we make one decision per user.
+                live_streams = await db.live_streams.find({"is_live": True}).to_list(500)
+                by_user: dict[str, list[dict]] = {}
+                for s in live_streams:
+                    by_user.setdefault(s.get("user_id"), []).append(s)
+
+                for user_id, streams in by_user.items():
+                    if not user_id:
+                        continue
+                    user = await db.users.find_one({"user_id": user_id})
+                    if not user:
+                        continue
+                    if user.get("plan") == "lifetime":
+                        continue
+
+                    live_entries = _active_entries(user)
+                    slot_budget = len(live_entries)
+
+                    if slot_budget == 0:
+                        # All plans expired — kill every live stream for this user.
+                        to_kill = streams
+                        reason = "plan_expired_sweep"
+                    elif len(streams) > slot_budget:
+                        # Slot count shrank — kill newest-first excess streams.
+                        streams_sorted = sorted(
+                            streams,
+                            key=lambda s: s.get("started_at") or datetime.min.replace(tzinfo=timezone.utc),
+                            reverse=True,
+                        )
+                        to_kill = streams_sorted[: len(streams_sorted) - slot_budget]
+                        reason = "slot_shrink_sweep"
+                    else:
+                        continue
+
+                    for s in to_kill:
+                        pid = s.get("ffmpeg_pid")
+                        if pid:
+                            try:
+                                youtube_service.stop_ffmpeg_push(pid)
+                            except Exception as e:
+                                logger.warning(f"sweeper: stop_ffmpeg_push pid={pid} failed: {e}")
+                        await db.live_streams.update_one(
+                            {"_id": s["_id"]},
+                            {"$set": {
+                                "is_live": False,
+                                "ffmpeg_pid": None,
+                                "stopped_at": now,
+                                "stopped_reason": reason,
+                            }},
+                        )
+                        logger.info(
+                            f"sweeper: stopped stream {s.get('stream_id')} "
+                            f"user={user_id} reason={reason}"
+                        )
+
+                    # If all plans expired, also refresh the user's legacy display fields
+                    if slot_budget == 0:
+                        await db.users.update_one(
+                            {"user_id": user_id},
+                            {"$set": {
+                                "active_plans": [],
+                                "plan": None,
+                                "plan_expires_at": None,
+                                "stream_slots": 0,
+                            }},
+                        )
+            except Exception as e:
+                logger.warning(f"plan expiry sweep loop error: {e}")
+            await asyncio.sleep(30)
+
+    asyncio.create_task(_plan_expiry_sweep_loop())
+
 # ==================== ADMIN DASHBOARD ====================
 #
 # All routes are gated by `get_admin_user` which returns 403 if the caller is
