@@ -209,3 +209,9 @@ Build "Live Adda" - a professional 24/7 YouTube Live streaming SaaS platform.
 - FRONTEND sidebar — Admin sees "Analytics" nav item (conditional on `role==='admin' || plan==='lifetime'`)
 - VERIFIED via direct curl + Playwright: /admin/summary returns 56 users + 9 open tickets, /admin/system returns real CPU 7.9% RAM 48.4% Disk 15.7%, admin-dashboard renders all 5 tabs, 9 tickets surface in Tickets tab with badge, sidebar Analytics link visible, admin-home-summary card renders on Dashboard home.
 
+
+
+## Deploy Script Auto-Heal (2026-07)
+- `/app/deploy/update.sh` now rewrites any Nginx upstream still pointing at `127.0.0.1:8000` to `127.0.0.1:8001` and runs `nginx -t && systemctl reload nginx` in step [4/5].
+- Fixes the Cloudflare 502 the user hit in production when their Nginx site config was stuck on the old backend port.
+- Runs after `git pull` + `yarn build`, so every subsequent `sudo ./deploy/update.sh` self-heals the port mismatch.

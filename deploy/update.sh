@@ -73,8 +73,12 @@ export GENERATE_SOURCEMAP=false
 export CI=false
 yarn build
 
-echo "==> [4/5] Reloading Nginx..."
-systemctl reload nginx
+echo "==> [4/5] Healing Nginx upstream port (8000 -> 8001) and reloading..."
+# Auto-heal: older deploys pointed Nginx at 127.0.0.1:8000, but the backend
+# runs on 8001. Rewrite any stale references so future updates self-correct
+# instead of returning 502 Bad Gateway.
+sed -i 's|127.0.0.1:8000|127.0.0.1:8001|g' /etc/nginx/sites-available/* /etc/nginx/sites-enabled/* 2>/dev/null || true
+nginx -t && systemctl reload nginx
 
 echo "==> [5/5] Done. Verify at your domain."
 echo "    Landing page should now show INR (₹35/₹199/₹599) and title 'Live Adda'."
