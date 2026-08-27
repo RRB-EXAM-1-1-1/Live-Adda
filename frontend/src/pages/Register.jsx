@@ -3,7 +3,7 @@ import { useNavigate, Link } from 'react-router-dom';
 import { Button } from '../components/ui/button';
 import { Input } from '../components/ui/input';
 import { Label } from '../components/ui/label';
-import { Radio, Mail, Lock, User, Eye, EyeOff } from 'lucide-react';
+import { Radio, Mail, Lock, User, Phone, Eye, EyeOff } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext';
 
 const Register = () => {
@@ -12,6 +12,7 @@ const Register = () => {
   const [formData, setFormData] = useState({
     name: '',
     email: '',
+    mobileNumber: '',
     password: '',
     confirmPassword: ''
   });
@@ -30,8 +31,15 @@ const Register = () => {
     setError('');
 
     // Validation
-    if (!formData.name || !formData.email || !formData.password || !formData.confirmPassword) {
+    if (!formData.name || !formData.email || !formData.mobileNumber || !formData.password || !formData.confirmPassword) {
       setError('All fields are required');
+      return;
+    }
+
+    // Basic mobile-number sanity check: 7–15 digits (allow +, spaces, dashes when typing)
+    const digitsOnly = formData.mobileNumber.replace(/[^\d]/g, '');
+    if (digitsOnly.length < 7 || digitsOnly.length > 15) {
+      setError('Please enter a valid mobile number');
       return;
     }
 
@@ -46,7 +54,7 @@ const Register = () => {
     }
 
     setIsLoading(true);
-    const result = await register(formData.email, formData.password, formData.name);
+    const result = await register(formData.email, formData.password, formData.name, formData.mobileNumber.trim());
     setIsLoading(false);
 
     if (result.success) {
@@ -143,6 +151,25 @@ const Register = () => {
                   className="pl-10 py-6 bg-gray-50 border-gray-200 focus:border-blue-500 focus:ring-blue-500 transition-all"
                 />
               </div>
+            </div>
+
+            <div>
+              <Label htmlFor="mobileNumber" className="text-gray-700 font-medium">Mobile Number</Label>
+              <div className="relative mt-1">
+                <Phone className="absolute left-3 top-1/2 transform -translate-y-1/2 w-5 h-5 text-gray-400" />
+                <Input
+                  id="mobileNumber"
+                  name="mobileNumber"
+                  type="tel"
+                  inputMode="tel"
+                  placeholder="+91 98765 43210"
+                  value={formData.mobileNumber}
+                  onChange={handleChange}
+                  data-testid="register-mobile-input"
+                  className="pl-10 py-6 bg-gray-50 border-gray-200 focus:border-blue-500 focus:ring-blue-500 transition-all"
+                />
+              </div>
+              <p className="mt-1 text-xs text-gray-500">Used for WhatsApp/SMS support & payment updates</p>
             </div>
 
             <div>

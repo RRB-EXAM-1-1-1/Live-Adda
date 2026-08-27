@@ -14,7 +14,7 @@ import api from '../services/api';
 import { useAuth } from '../contexts/AuthContext';
 import { toast } from 'sonner';
 
-const StatCard = ({ icon: Icon, label, value, tone = 'blue', testid }) => {
+const StatCard = ({ icon: Icon, label, value, tone = 'blue', testid, onClick }) => {
   const tones = {
     blue: 'from-blue-500/20 to-blue-600/10 border-blue-500/30 text-blue-300',
     red: 'from-red-500/20 to-red-600/10 border-red-500/30 text-red-300',
@@ -22,14 +22,24 @@ const StatCard = ({ icon: Icon, label, value, tone = 'blue', testid }) => {
     amber: 'from-amber-500/20 to-amber-600/10 border-amber-500/30 text-amber-300',
     purple: 'from-purple-500/20 to-purple-600/10 border-purple-500/30 text-purple-300',
   };
+  const clickable = typeof onClick === 'function';
   return (
-    <div className={`bg-gradient-to-br ${tones[tone]} border rounded-2xl p-5`} data-testid={testid}>
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={!clickable}
+      className={`text-left w-full bg-gradient-to-br ${tones[tone]} border rounded-2xl p-5 transition-all ${
+        clickable ? 'hover:scale-[1.02] hover:brightness-110 cursor-pointer' : 'cursor-default'
+      }`}
+      data-testid={testid}
+    >
       <div className="flex items-center justify-between mb-2">
         <span className="text-xs uppercase tracking-wider text-gray-400 font-semibold">{label}</span>
         <Icon className="w-5 h-5 opacity-60" />
       </div>
       <p className="text-3xl font-bold text-white" data-testid={`${testid}-value`}>{value ?? '—'}</p>
-    </div>
+      {clickable && <p className="text-[10px] text-gray-400 mt-2 uppercase tracking-wider">Click for details →</p>}
+    </button>
   );
 };
 
@@ -56,6 +66,10 @@ const AdminDashboard = () => {
   const [replyOpen, setReplyOpen] = useState(null);      // ticket_id
   const [replyText, setReplyText] = useState('');
   const [broadcast, setBroadcast] = useState({ title: '', body: '', audience: 'all', severity: 'info' });
+
+  // Drill-down dialogs opened from Overview stat cards
+  const [detail, setDetail] = useState(null);     // { title, kind: 'users' | 'videos', rows: [] }
+  const [detailLoading, setDetailLoading] = useState(false);
 
   const isAdmin = user?.role === 'admin' || user?.plan === 'lifetime';
 
@@ -144,6 +158,52 @@ const AdminDashboard = () => {
     catch { toast.error('Failed to delete'); }
   };
 
+  // --- Overview card drill-downs ------------------------------------------------
+  const openUserDetail = async (title, filter) => {
+    setDetail({ title, kind: 'users', rows: [] });
+    setDetailLoading(true);
+    try {
+      const { data } = await api.get(`/admin/users/filtered?filter=${filter}`);
+      setDetail({ title, kind: 'users', rows: data.users || [] });
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || 'Failed to load list');
+      setDetail(null);
+    } finally {
+      setDetailLoading(false);
+    }
+  };
+
+  const openVideosDetail = async () => {
+    setDetail({ title: 'All Videos', kind: 'videos', rows: [] });
+    setDetailLoading(true);
+    try {
+      const { data } = await api.get('/admin/videos?limit=500');
+      setDetail({ title: 'All Videos', kind: 'videos', rows: data.videos || [] });
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || 'Failed to load videos');
+      setDetail(null);
+    } finally {
+      setDetailLoading(false);
+    }
+  };
+
+  const deleteVideoAsAdmin = async (v) => {
+    const warn = v.is_live
+      ? `⚠️ This video is CURRENTLY LIVE STREAMING for ${v.user_email}.\n\nDeleting it will force-stop the stream immediately AND remove the file from the server. This cannot be undone.\n\nProceed?`
+      : `Delete "${v.title || v.filename}" (owner: ${v.user_email})?\n\nThe file will be removed from the server and this cannot be undone.`;
+    if (!window.confirm(warn)) return;
+    try {
+      const { data } = await api.delete(`/admin/videos/${v.video_id}`);
+      toast.success(`Deleted (${(data.bytes_freed / (1024 * 1024)).toFixed(0)} MB freed${data.streams_stopped ? `, ${data.streams_stopped} stream stopped` : ''})`);
+      // Refresh the open dialog + summary in the background
+      await openVideosDetail();
+      await loadSummary();
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || 'Failed to delete video');
+    }
+  };
+  // ------------------------------------------------------------------------------
+
   if (!isAdmin) {
     return (
       <div className="p-8 text-center text-gray-400" data-testid="admin-forbidden">
@@ -199,14 +259,22 @@ const AdminDashboard = () => {
       {tab === 'overview' && (
         <div className="space-y-6" data-testid="admin-overview">
           <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-            <StatCard testid="stat-live" icon={Radio} tone="red" label="Live Now" value={summary?.live_users} />
-            <StatCard testid="stat-total-users" icon={Users} tone="blue" label="Total Users" value={summary?.total_users} />
-            <StatCard testid="stat-paying" icon={CheckCircle} tone="emerald" label="Paying Users" value={summary?.active_paying_users} />
-            <StatCard testid="stat-tickets" icon={MessageSquare} tone="amber" label="Open Tickets" value={summary?.open_tickets} />
-            <StatCard testid="stat-signups-today" icon={Users} tone="purple" label="Sign-ups Today" value={summary?.signups_today} />
-            <StatCard testid="stat-signups-week" icon={Users} tone="purple" label="Sign-ups (7d)" value={summary?.signups_this_week} />
-            <StatCard testid="stat-live-streams" icon={Radio} tone="red" label="Active Streams" value={summary?.live_streams} />
-            <StatCard testid="stat-videos" icon={Video} tone="blue" label="Total Videos" value={summary?.total_videos} />
+            <StatCard testid="stat-live" icon={Radio} tone="red" label="Live Now" value={summary?.live_users}
+              onClick={() => setTab('live')} />
+            <StatCard testid="stat-total-users" icon={Users} tone="blue" label="Total Users" value={summary?.total_users}
+              onClick={() => setTab('users')} />
+            <StatCard testid="stat-paying" icon={CheckCircle} tone="emerald" label="Paying Users" value={summary?.active_paying_users}
+              onClick={() => openUserDetail('Paying Users', 'paying')} />
+            <StatCard testid="stat-tickets" icon={MessageSquare} tone="amber" label="Open Tickets" value={summary?.open_tickets}
+              onClick={() => setTab('tickets')} />
+            <StatCard testid="stat-signups-today" icon={Users} tone="purple" label="Sign-ups Today" value={summary?.signups_today}
+              onClick={() => openUserDetail('Sign-ups Today', 'signups_today')} />
+            <StatCard testid="stat-signups-week" icon={Users} tone="purple" label="Sign-ups (7d)" value={summary?.signups_this_week}
+              onClick={() => openUserDetail('Sign-ups (7 days)', 'signups_7d')} />
+            <StatCard testid="stat-live-streams" icon={Radio} tone="red" label="Active Streams" value={summary?.live_streams}
+              onClick={() => setTab('live')} />
+            <StatCard testid="stat-videos" icon={Video} tone="blue" label="Total Videos" value={summary?.total_videos}
+              onClick={openVideosDetail} />
           </div>
 
           {/* System health */}
@@ -546,6 +614,104 @@ const AdminDashboard = () => {
             <Button onClick={() => sendReply(replyOpen, false)} data-testid="ticket-reply-send">Send reply</Button>
             <Button variant="destructive" onClick={() => sendReply(replyOpen, true)} data-testid="ticket-close">Send & Close</Button>
           </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Card drill-down dialog (Paying Users, Sign-ups, All Videos) */}
+      <Dialog open={!!detail} onOpenChange={() => setDetail(null)}>
+        <DialogContent className="max-w-5xl bg-gray-900 border-gray-700 text-white" data-testid="drilldown-dialog">
+          <DialogHeader>
+            <DialogTitle data-testid="drilldown-title">{detail?.title}</DialogTitle>
+            <DialogDescription className="text-gray-400">
+              {detailLoading ? 'Loading…' : `${detail?.rows?.length ?? 0} record${(detail?.rows?.length ?? 0) === 1 ? '' : 's'}`}
+            </DialogDescription>
+          </DialogHeader>
+
+          {detail?.kind === 'users' && (
+            <div className="overflow-x-auto max-h-[60vh]">
+              <table className="w-full text-sm">
+                <thead className="text-gray-400 text-xs uppercase border-b border-gray-800 sticky top-0 bg-gray-900">
+                  <tr>
+                    <th className="text-left py-2 px-2">Email</th>
+                    <th className="text-left py-2 px-2">Mobile</th>
+                    <th className="text-left py-2 px-2">Plan</th>
+                    <th className="text-left py-2 px-2">Signed up</th>
+                    <th className="text-left py-2 px-2">Expires</th>
+                  </tr>
+                </thead>
+                <tbody data-testid="drilldown-users-body">
+                  {detail.rows.map((u) => (
+                    <tr key={u.user_id} className="border-b border-gray-800 hover:bg-gray-800/40">
+                      <td className="py-2 px-2 text-white">{u.email}</td>
+                      <td className="py-2 px-2 text-gray-300">{u.mobile_number || '—'}</td>
+                      <td className="py-2 px-2">
+                        <span className={`px-2 py-0.5 rounded text-xs font-semibold ${
+                          u.plan === 'lifetime' ? 'bg-purple-500/20 text-purple-300'
+                          : u.plan ? 'bg-emerald-500/20 text-emerald-300'
+                          : 'bg-gray-700 text-gray-400'
+                        }`}>{u.plan || 'free'}</span>
+                      </td>
+                      <td className="py-2 px-2 text-gray-300">{fmtDate(u.created_at)}</td>
+                      <td className="py-2 px-2 text-gray-300">{u.plan === 'lifetime' ? '∞' : fmtDate(u.plan_expires_at)}</td>
+                    </tr>
+                  ))}
+                  {detail.rows.length === 0 && !detailLoading && (
+                    <tr><td colSpan={5} className="py-6 text-center text-gray-500">No matching users.</td></tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {detail?.kind === 'videos' && (
+            <div className="overflow-x-auto max-h-[60vh]">
+              <table className="w-full text-sm">
+                <thead className="text-gray-400 text-xs uppercase border-b border-gray-800 sticky top-0 bg-gray-900">
+                  <tr>
+                    <th className="text-left py-2 px-2">Title</th>
+                    <th className="text-left py-2 px-2">Owner</th>
+                    <th className="text-left py-2 px-2">Size</th>
+                    <th className="text-left py-2 px-2">Res</th>
+                    <th className="text-left py-2 px-2">Uploaded</th>
+                    <th className="text-left py-2 px-2">Status</th>
+                    <th className="text-right py-2 px-2">Action</th>
+                  </tr>
+                </thead>
+                <tbody data-testid="drilldown-videos-body">
+                  {detail.rows.map((v) => (
+                    <tr key={v.video_id} className="border-b border-gray-800 hover:bg-gray-800/40">
+                      <td className="py-2 px-2 text-white max-w-[220px] truncate" title={v.title}>{v.title || v.filename || '(untitled)'}</td>
+                      <td className="py-2 px-2 text-gray-300 max-w-[180px] truncate" title={v.user_email}>{v.user_email || '—'}</td>
+                      <td className="py-2 px-2 text-gray-300">{formatBytes(v.size)}</td>
+                      <td className="py-2 px-2 text-gray-300">{v.height ? `${v.height}p` : '—'}</td>
+                      <td className="py-2 px-2 text-gray-300">{fmtDateOnly(v.uploaded_at)}</td>
+                      <td className="py-2 px-2">
+                        {v.is_live ? (
+                          <span className="px-2 py-0.5 rounded bg-red-500/20 text-red-300 text-xs font-semibold">● LIVE</span>
+                        ) : (
+                          <span className="px-2 py-0.5 rounded bg-gray-700 text-gray-400 text-xs">idle</span>
+                        )}
+                      </td>
+                      <td className="py-2 px-2 text-right">
+                        <Button
+                          variant="destructive"
+                          size="sm"
+                          onClick={() => deleteVideoAsAdmin(v)}
+                          data-testid={`admin-delete-video-${v.video_id}`}
+                          className="h-7 px-2"
+                        >
+                          <Trash2 className="w-3.5 h-3.5 mr-1" /> Delete
+                        </Button>
+                      </td>
+                    </tr>
+                  ))}
+                  {detail.rows.length === 0 && !detailLoading && (
+                    <tr><td colSpan={7} className="py-6 text-center text-gray-500">No videos on the server.</td></tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          )}
         </DialogContent>
       </Dialog>
     </div>

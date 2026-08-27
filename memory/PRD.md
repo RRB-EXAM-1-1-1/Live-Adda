@@ -211,6 +211,27 @@ Build "Live Adda" - a professional 24/7 YouTube Live streaming SaaS platform.
 
 
 
+## Clickable Analytics Cards + Admin Video Delete + Instant Auto-Purge + Mobile Signup (2026-07)
+
+**Backend (`server.py`)**
+- `UserRegister` model + `/api/auth/register` now accept `mobile_number` — stored on the user doc, surfaced everywhere (admin tables, drilldowns, ticket views).
+- New `GET /api/admin/videos` — every video joined with owner email/mobile/plan + `is_live` flag.
+- New `DELETE /api/admin/videos/{video_id}` — admin hammer: force-stops any live stream on that video, deletes file + thumbnail + row, refunds storage. Returns `{bytes_freed, streams_stopped}`.
+- New `GET /api/admin/users/filtered?filter=paying|signups_today|signups_7d` — feeds the click-through dialogs.
+- **Auto-purge wired everywhere**:
+  - Reaper (15 s): when ffmpeg self-exits, calls `cleanup_stream_video_if_orphaned` so disk frees immediately.
+  - Sweeper (30 s): on `plan_expired_sweep` calls `wipe_all_videos_for_user`; on `slot_shrink_sweep` calls `cleanup_stream_video_if_orphaned` per killed stream.
+  - Admin force-stop endpoint: now purges the orphaned video too.
+
+**Frontend**
+- `Register.jsx`: added required Mobile Number field with `Phone` icon, tel input, 7–15 digit sanity check, WhatsApp/SMS helper text. Chained through `AuthContext.register(...)` → `authAPI.register(...)`.
+- `AdminDashboard.jsx`: converted `StatCard` to a real button. Every Overview card is now clickable:
+  - Live Now / Active Streams → jump to Live Users tab
+  - Total Users → jump to Users tab
+  - Open Tickets → jump to Tickets tab
+  - Paying Users / Sign-ups Today / Sign-ups 7d → open a modal table with email + mobile + plan + created_at + expires_at
+  - Total Videos → open a modal table of every video with size / resolution / owner + a red per-row **Delete** button (double-confirms if the video is currently live)
+
 ## YouTube Live Smooth Ingest (2026-07)
 Fixes the "YouTube is not receiving enough video to maintain smooth streaming" alert. Every flag below is defensible: it's either a documented YouTube-live requirement or a fix for a real cause of RTMP-side buffering.
 

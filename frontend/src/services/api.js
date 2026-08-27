@@ -62,9 +62,9 @@ const formatApiError = (error) => {
 
 // Auth APIs
 export const authAPI = {
-  register: async (email, password, name) => {
+  register: async (email, password, name, mobileNumber) => {
     try {
-      const { data } = await api.post('/auth/register', { email, password, name });
+      const { data } = await api.post('/auth/register', { email, password, name, mobile_number: mobileNumber });
       return { data, error: null };
     } catch (error) {
       return { data: null, error: formatApiError(error) };

@@ -241,6 +241,7 @@ class UserRegister(BaseModel):
     email: EmailStr
     password: str
     name: str
+    mobile_number: Optional[str] = None
 
 class UserLogin(BaseModel):
     email: EmailStr
@@ -654,6 +655,7 @@ async def register(user_data: UserRegister):
         "user_id": user_id,
         "email": email,
         "name": user_data.name,
+        "mobile_number": (user_data.mobile_number or "").strip() or None,
         "password_hash": password_hash,
         "plan": None,
         "plan_expires_at": None,
@@ -2313,15 +2315,26 @@ async def startup_event():
             try:
                 finished = youtube_service.reap_finished_pushes()
                 for pid in finished:
-                    await db.live_streams.update_many(
-                        {"ffmpeg_pid": pid, "is_live": True},
-                        {"$set": {
-                            "is_live": False,
-                            "ffmpeg_pid": None,
-                            "stopped_at": datetime.now(timezone.utc),
-                            "stopped_reason": "ffmpeg_exited",
-                        }},
-                    )
+                    # Find every stream row that was live under this pid so we
+                    # can also auto-purge its video (freeing disk immediately
+                    # when a stream naturally ends).
+                    async for s in db.live_streams.find({"ffmpeg_pid": pid, "is_live": True}):
+                        await db.live_streams.update_one(
+                            {"_id": s["_id"]},
+                            {"$set": {
+                                "is_live": False,
+                                "ffmpeg_pid": None,
+                                "stopped_at": datetime.now(timezone.utc),
+                                "stopped_reason": "ffmpeg_exited",
+                            }},
+                        )
+                        vid = s.get("video_id")
+                        uid = s.get("user_id")
+                        if vid and uid:
+                            try:
+                                await cleanup_stream_video_if_orphaned(uid, vid)
+                            except Exception as e:
+                                logger.warning(f"reaper: video cleanup failed vid={vid}: {e}")
             except Exception as e:
                 logger.warning(f"ffmpeg reaper loop error: {e}")
             await asyncio.sleep(15)
@@ -2392,8 +2405,18 @@ async def startup_event():
                             f"sweeper: stopped stream {s.get('stream_id')} "
                             f"user={user_id} reason={reason}"
                         )
+                        # slot_shrink: only delete the video if no other slot
+                        # on this account still uses it. plan_expired handled below.
+                        if reason == "slot_shrink_sweep":
+                            vid = s.get("video_id")
+                            if vid:
+                                try:
+                                    await cleanup_stream_video_if_orphaned(user_id, vid)
+                                except Exception as e:
+                                    logger.warning(f"sweeper: video cleanup failed vid={vid}: {e}")
 
                     # If all plans expired, also refresh the user's legacy display fields
+                    # AND wipe every video they had — disk must not linger.
                     if slot_budget == 0:
                         await db.users.update_one(
                             {"user_id": user_id},
@@ -2404,6 +2427,12 @@ async def startup_event():
                                 "stream_slots": 0,
                             }},
                         )
+                        try:
+                            wiped = await wipe_all_videos_for_user(user_id)
+                            if wiped:
+                                logger.info(f"sweeper: wiped {wiped} videos for expired user {user_id}")
+                        except Exception as e:
+                            logger.warning(f"sweeper: wipe_all_videos_for_user failed user={user_id}: {e}")
             except Exception as e:
                 logger.warning(f"plan expiry sweep loop error: {e}")
             await asyncio.sleep(30)
@@ -2543,8 +2572,8 @@ async def admin_live_users(admin: dict = Depends(get_admin_user)):
 @api_router.post("/admin/stream/{stream_id}/stop")
 async def admin_force_stop_stream(stream_id: str, admin: dict = Depends(get_admin_user)):
     """Admin force-stop a specific live stream. Marks the stream as stopped
-    with `stopped_reason='admin_force_stop'`. Does NOT delete the video (admin
-    intervention should be reversible)."""
+    with `stopped_reason='admin_force_stop'` AND deletes the orphaned video
+    file so disk is reclaimed immediately."""
     stream = await db.live_streams.find_one({"stream_id": stream_id, "is_live": True})
     if not stream:
         raise HTTPException(status_code=404, detail="Stream not found or already stopped")
@@ -2562,6 +2591,14 @@ async def admin_force_stop_stream(stream_id: str, admin: dict = Depends(get_admi
             "stopped_by_admin": admin.get("user_id"),
         }}
     )
+    # Auto-purge the orphaned video (skipped if another slot still uses it).
+    vid = stream.get("video_id")
+    uid = stream.get("user_id")
+    if vid and uid:
+        try:
+            await cleanup_stream_video_if_orphaned(uid, vid)
+        except Exception as e:
+            logger.warning(f"admin_force_stop_stream: video cleanup failed vid={vid}: {e}")
     logger.info(f"Admin {admin.get('email')} force-stopped stream {stream_id}")
     return {"message": "Stream stopped by admin", "stream_id": stream_id}
 
@@ -2736,6 +2773,139 @@ async def admin_delete_broadcast(notification_id: str, admin: dict = Depends(get
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Broadcast not found")
     return {"message": "Broadcast deleted"}
+
+
+@api_router.get("/admin/videos")
+async def admin_list_videos(
+    q: Optional[str] = None,
+    limit: int = 200,
+    admin: dict = Depends(get_admin_user),
+):
+    """List every video across every user. Joins each row with the owner's
+    email/mobile/plan and a live-status flag so the admin dashboard can show
+    everything in one table and offer a per-row Delete button."""
+    query: dict = {}
+    if q:
+        # Search on title OR original filename OR user email (join done after)
+        query["$or"] = [
+            {"title": {"$regex": q, "$options": "i"}},
+            {"filename": {"$regex": q, "$options": "i"}},
+        ]
+    videos = await db.videos.find(query, {"_id": 0}).sort("uploaded_at", -1).limit(limit).to_list(limit)
+    # Batch-fetch owners
+    user_ids = list({v.get("user_id") for v in videos if v.get("user_id")})
+    users = await db.users.find(
+        {"user_id": {"$in": user_ids}},
+        {"_id": 0, "user_id": 1, "email": 1, "mobile_number": 1, "plan": 1},
+    ).to_list(len(user_ids) or 1)
+    user_by_id = {u["user_id"]: u for u in users}
+    # Live-lookup: which video_ids are currently streaming
+    live_video_ids = set(await db.live_streams.distinct("video_id", {"is_live": True}))
+    rows = []
+    for v in videos:
+        u = user_by_id.get(v.get("user_id"), {})
+        # Post-filter by email if q was provided and no title match hit
+        if q and q.lower() not in (u.get("email") or "").lower() \
+           and q.lower() not in (v.get("title") or "").lower() \
+           and q.lower() not in (v.get("filename") or "").lower():
+            continue
+        rows.append({
+            "video_id": v.get("video_id"),
+            "title": v.get("title"),
+            "filename": v.get("filename"),
+            "size": v.get("size", 0),
+            "height": v.get("height"),
+            "duration": v.get("duration"),
+            "uploaded_at": v["uploaded_at"].isoformat() if hasattr(v.get("uploaded_at"), "isoformat") else str(v.get("uploaded_at") or ""),
+            "processing_status": v.get("processing_status"),
+            "user_id": v.get("user_id"),
+            "user_email": u.get("email"),
+            "user_mobile": u.get("mobile_number"),
+            "user_plan": u.get("plan"),
+            "is_live": v.get("video_id") in live_video_ids,
+        })
+    return {"count": len(rows), "videos": rows}
+
+
+@api_router.delete("/admin/videos/{video_id}")
+async def admin_delete_video(video_id: str, admin: dict = Depends(get_admin_user)):
+    """Force-delete any user's video. If the video is currently live-streaming,
+    the stream is force-stopped first (SIGTERM→SIGKILL), THEN the file+row are
+    removed and the user's storage quota refunded. This is the admin's ultimate
+    disk-reclamation hammer — the frontend is expected to confirm before calling."""
+    video = await db.videos.find_one({"video_id": video_id})
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+    user_id = video.get("user_id")
+
+    # Force-stop any live stream that's serving this video
+    stopped_streams = 0
+    async for s in db.live_streams.find({"video_id": video_id, "is_live": True}):
+        if s.get("ffmpeg_pid"):
+            try:
+                youtube_service.stop_ffmpeg_push(s["ffmpeg_pid"])
+            except Exception as e:
+                logger.warning(f"admin_delete_video: kill pid={s.get('ffmpeg_pid')} failed: {e}")
+        await db.live_streams.update_one(
+            {"_id": s["_id"]},
+            {"$set": {
+                "is_live": False, "ffmpeg_pid": None,
+                "stopped_at": datetime.now(timezone.utc),
+                "stopped_reason": "admin_deleted_video",
+                "stopped_by_admin": admin.get("user_id"),
+            }},
+        )
+        stopped_streams += 1
+
+    freed = await _delete_video_files_and_row(user_id, video_id)
+    logger.info(
+        f"Admin {admin.get('email')} deleted video {video_id} "
+        f"(user {user_id}, freed {freed} bytes, stopped {stopped_streams} live stream(s))"
+    )
+    return {
+        "message": "Video deleted",
+        "video_id": video_id,
+        "bytes_freed": freed,
+        "streams_stopped": stopped_streams,
+    }
+
+
+@api_router.get("/admin/users/filtered")
+async def admin_list_users_filtered(
+    filter: str = "paying",  # "paying" | "signups_today" | "signups_7d"
+    admin: dict = Depends(get_admin_user),
+):
+    """Filtered user lists used by the click-through dialogs on the analytics
+    overview cards (Paying Users, Sign-ups Today, Sign-ups 7D). Every row
+    includes email + mobile + plan + created_at so the admin has everything
+    in one place."""
+    now = datetime.now(timezone.utc)
+    if filter == "paying":
+        query = {"$or": [
+            {"plan": "lifetime"},
+            {"plan_expires_at": {"$gt": now}},
+        ]}
+    elif filter == "signups_today":
+        query = {"created_at": {"$gte": now.replace(hour=0, minute=0, second=0, microsecond=0)}}
+    elif filter == "signups_7d":
+        query = {"created_at": {"$gte": now - timedelta(days=7)}}
+    else:
+        raise HTTPException(status_code=400, detail="Unknown filter")
+
+    users = await db.users.find(query, {"_id": 0, "password_hash": 0}).sort("created_at", -1).limit(500).to_list(500)
+    rows = []
+    for u in users:
+        rows.append({
+            "user_id": u.get("user_id"),
+            "email": u.get("email"),
+            "name": u.get("name"),
+            "mobile_number": u.get("mobile_number"),
+            "plan": u.get("plan"),
+            "role": u.get("role"),
+            "created_at": u["created_at"].isoformat() if hasattr(u.get("created_at"), "isoformat") else str(u.get("created_at")),
+            "plan_expires_at": u["plan_expires_at"].isoformat() if hasattr(u.get("plan_expires_at"), "isoformat") else None,
+        })
+    return {"count": len(rows), "filter": filter, "users": rows}
 
 
 # ==================== USER-SIDE NOTIFICATIONS ====================

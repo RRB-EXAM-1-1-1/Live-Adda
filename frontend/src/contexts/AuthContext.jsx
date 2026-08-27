@@ -42,8 +42,8 @@ export const AuthProvider = ({ children }) => {
     return { success: false, error };
   };
 
-  const register = async (email, password, name) => {
-    const { data, error } = await authAPI.register(email, password, name);
+  const register = async (email, password, name, mobileNumber) => {
+    const { data, error } = await authAPI.register(email, password, name, mobileNumber);
     if (data) {
       setUser(data);
       setIsAuthenticated(true);
