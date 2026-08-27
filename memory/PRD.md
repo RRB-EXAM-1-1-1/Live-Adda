@@ -211,6 +211,15 @@ Build "Live Adda" - a professional 24/7 YouTube Live streaming SaaS platform.
 
 
 
+## FFmpeg CPU Optimizations (2026-07)
+For the 2 vCPU / 4 GB DigitalOcean droplet the user runs in production:
+- **Preset**: re-encode path switched from `-preset veryfast` → `-preset ultrafast -tune zerolatency`.
+- **Bitrate**: dropped from 2500k / max 2500k / buf 5000k → **1200k / max 1500k / buf 3000k** (matches 720p transcoded sources, avoids CPU throttling blur).
+- **Stream copy**: new `ffprobe` step in `start_ffmpeg_push`. If source is already `h264` + `aac`, the push uses `-c copy -bsf:a aac_adtstoasc` (near-zero CPU). Otherwise falls back to the ultrafast re-encode above.
+- **Process cleanup**: ffmpeg now spawned with `start_new_session=True`; `stop_ffmpeg_push` sends SIGTERM to the whole process group, waits 5 s, escalates to SIGKILL, and always reaps the Popen so no zombies remain.
+- **Reaper task**: new `_ffmpeg_reaper_loop` runs every 15 s from the FastAPI startup hook — catches ffmpeg processes that exited on their own (YouTube dropped RTMP, file removed) and flips their `live_streams` row to `is_live=False, stopped_reason="ffmpeg_exited"`.
+- Callers of `start_ffmpeg_push` / `stop_ffmpeg_push` are unchanged (drop-in signature).
+
 ## Deploy Script Auto-Heal (2026-07)
 - `/app/deploy/update.sh` now rewrites any Nginx upstream still pointing at `127.0.0.1:8000` to `127.0.0.1:8001` and runs `nginx -t && systemctl reload nginx` in step [4/5].
 - Fixes the Cloudflare 502 the user hit in production when their Nginx site config was stuck on the old backend port.

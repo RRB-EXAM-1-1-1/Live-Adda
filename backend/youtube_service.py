@@ -5,9 +5,13 @@ and ffmpeg-based RTMP push of pre-uploaded videos.
 
 Requires env: YOUTUBE_CLIENT_ID, YOUTUBE_CLIENT_SECRET
 """
+import json
 import os
+import signal
 import subprocess
 import logging
+import threading
+import time
 from datetime import datetime, timezone
 
 from google_auth_oauthlib.flow import Flow
@@ -173,38 +177,166 @@ def create_broadcast_and_stream(account_doc: dict, title: str, description: str 
     }
 
 
+# Track Popen handles by PID so we can .wait() them on stop and avoid zombies.
+# If the backend restarts we lose this map; the reaper below (psutil) handles
+# such orphans by signalling directly and marking DB rows stopped.
+_running_procs: "dict[int, subprocess.Popen]" = {}
+_procs_lock = threading.Lock()
+
+
+def _probe_codecs(video_path: str) -> "tuple[str | None, str | None]":
+    """Return (video_codec, audio_codec) for a local file, or (None, None) on error."""
+    try:
+        out = subprocess.check_output(
+            [
+                "ffprobe", "-v", "error", "-print_format", "json",
+                "-show_streams", "-select_streams", "v:0,a:0", video_path,
+            ],
+            stderr=subprocess.DEVNULL,
+            timeout=8,
+        )
+        streams = json.loads(out).get("streams", [])
+        v = next((s.get("codec_name") for s in streams if s.get("codec_type") == "video"), None)
+        a = next((s.get("codec_name") for s in streams if s.get("codec_type") == "audio"), None)
+        return v, a
+    except Exception as e:
+        logger.warning(f"ffprobe failed for {video_path}: {e}")
+        return None, None
+
+
 def start_ffmpeg_push(video_path: str, stream_key: str, loop: bool = True) -> int:
     """Start an ffmpeg process pushing the given local video to YouTube RTMP.
-    Returns the process PID. Uses -c copy when possible for low CPU.
+
+    CPU optimizations for shared 2 vCPU droplet:
+      1. If the source is already h264+aac (YouTube-compatible), use `-c copy`
+         so no re-encoding happens (near-zero CPU).
+      2. Otherwise re-encode with `-preset ultrafast` and a 1200k target
+         bitrate (matches 720p reasonably, avoids CPU throttling blur).
+      3. Spawn in its own process group so we can SIGTERM/SIGKILL the whole
+         group on stop and never leak orphaned encoders.
     """
     rtmp_url = f"{RTMP_BASE}/{stream_key}"
-    cmd = ["ffmpeg", "-re"]
+    v_codec, a_codec = _probe_codecs(video_path)
+    can_copy = (v_codec == "h264" and a_codec == "aac")
+
+    cmd: list[str] = ["ffmpeg", "-re"]
     if loop:
         cmd += ["-stream_loop", "-1"]
-    cmd += [
-        "-i", video_path,
-        "-c:v", "libx264", "-preset", "veryfast", "-b:v", "2500k",
-        "-maxrate", "2500k", "-bufsize", "5000k", "-pix_fmt", "yuv420p", "-g", "60",
-        "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
-        "-f", "flv", rtmp_url,
-    ]
+    cmd += ["-i", video_path]
+
+    if can_copy:
+        # Zero-encode passthrough. YouTube accepts this as-is.
+        cmd += ["-c", "copy", "-bsf:a", "aac_adtstoasc"]
+        mode = "copy"
+    else:
+        # Ultrafast preset trades a bit of compression efficiency for a
+        # large CPU drop — right call on a 2 vCPU box under contention.
+        cmd += [
+            "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+            "-b:v", "1200k", "-maxrate", "1500k", "-bufsize", "3000k",
+            "-pix_fmt", "yuv420p", "-g", "60",
+            "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+        ]
+        mode = "reencode-ultrafast"
+
+    cmd += ["-f", "flv", rtmp_url]
+
     log_path = f"/tmp/ffmpeg_{stream_key[:8]}.log"
-    with open(log_path, "wb") as logf:
-        proc = subprocess.Popen(cmd, stdout=logf, stderr=logf)
-    logger.info(f"Started ffmpeg push PID={proc.pid} -> {RTMP_BASE}/***")
+    logf = open(log_path, "wb")
+    # start_new_session=True → new process group, so os.killpg reaches every
+    # child ffmpeg spawns (filters, muxers, etc.) and nothing is left behind.
+    proc = subprocess.Popen(
+        cmd, stdout=logf, stderr=logf, stdin=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    with _procs_lock:
+        _running_procs[proc.pid] = proc
+    logger.info(
+        f"Started ffmpeg push PID={proc.pid} mode={mode} "
+        f"src_codecs=v:{v_codec}/a:{a_codec} -> {RTMP_BASE}/***"
+    )
     return proc.pid
 
 
 def stop_ffmpeg_push(pid: int) -> bool:
-    """Stop a running ffmpeg push process by PID."""
-    try:
-        os.kill(pid, 15)  # SIGTERM
+    """Terminate an ffmpeg push cleanly, escalating to SIGKILL and always
+    reaping the child so we never leave zombie processes behind.
+    """
+    if not pid:
+        return False
+
+    with _procs_lock:
+        proc = _running_procs.pop(pid, None)
+
+    # Path 1: we still hold the Popen — clean, in-process kill + reap.
+    if proc is not None:
+        try:
+            pgid = os.getpgid(proc.pid)
+            os.killpg(pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except Exception as e:
+            logger.warning(f"SIGTERM to pgid failed pid={pid}: {e}")
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            logger.warning(f"ffmpeg pid={pid} ignored SIGTERM, sending SIGKILL")
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=3)
+            except Exception:
+                pass
+        except Exception as e:
+            logger.warning(f"proc.wait failed pid={pid}: {e}")
         return True
+
+    # Path 2: backend restarted and lost the handle — signal by PID.
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
     except ProcessLookupError:
         return False
-    except Exception as e:
-        logger.error(f"Failed to stop ffmpeg PID={pid}: {e}")
-        return False
+    except Exception:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return False
+        except Exception as e:
+            logger.error(f"stop_ffmpeg_push signal failed pid={pid}: {e}")
+            return False
+    # Escalate if still alive
+    for _ in range(10):
+        try:
+            os.kill(pid, 0)  # existence check
+        except ProcessLookupError:
+            return True
+        time.sleep(0.5)
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGKILL)
+    except Exception:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except Exception:
+            pass
+    return True
+
+
+def reap_finished_pushes() -> list[int]:
+    """Reap any tracked ffmpeg processes that exited on their own (e.g. YouTube
+    dropped the connection, source file was removed). Returns list of PIDs
+    that finished. Callers should mark the DB row `is_live=False` for these.
+    """
+    finished: list[int] = []
+    with _procs_lock:
+        for pid, proc in list(_running_procs.items()):
+            rc = proc.poll()
+            if rc is not None:
+                _running_procs.pop(pid, None)
+                finished.append(pid)
+                logger.info(f"ffmpeg pid={pid} exited on its own rc={rc}")
+    return finished
 
 
 def transition_broadcast(account_doc: dict, broadcast_id: str, status: str) -> dict:

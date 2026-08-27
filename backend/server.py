@@ -2297,6 +2297,30 @@ async def startup_event():
             f.write("- GET /api/videos\n")
             f.write("- POST /api/payments/checkout-session\n")
 
+    # Background reaper: catches ffmpeg processes that exited on their own
+    # (YouTube dropped RTMP, source file was deleted, etc.) and marks the
+    # matching live_streams row `is_live=False`. Prevents zombie processes
+    # from lingering and keeps the "live users" admin table accurate.
+    async def _ffmpeg_reaper_loop():
+        while True:
+            try:
+                finished = youtube_service.reap_finished_pushes()
+                for pid in finished:
+                    await db.live_streams.update_many(
+                        {"ffmpeg_pid": pid, "is_live": True},
+                        {"$set": {
+                            "is_live": False,
+                            "ffmpeg_pid": None,
+                            "stopped_at": datetime.now(timezone.utc),
+                            "stopped_reason": "ffmpeg_exited",
+                        }},
+                    )
+            except Exception as e:
+                logger.warning(f"ffmpeg reaper loop error: {e}")
+            await asyncio.sleep(15)
+
+    asyncio.create_task(_ffmpeg_reaper_loop())
+
 # ==================== ADMIN DASHBOARD ====================
 #
 # All routes are gated by `get_admin_user` which returns 403 if the caller is
