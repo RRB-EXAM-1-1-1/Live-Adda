@@ -4,6 +4,8 @@ from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
+import re
+import time
 import logging
 from pathlib import Path
 from pydantic import BaseModel, Field, EmailStr
@@ -699,6 +701,135 @@ async def register(user_data: UserRegister):
     
     return response
 
+
+# ==================== PASSWORD RESET (OTP-based) ====================
+#
+# Flow:
+#   1. User calls /auth/forgot-password with {email, channel: 'email'|'sms'}
+#   2. Backend generates a 6-digit OTP, stores its bcrypt hash + attempts + TTL
+#      in the `password_reset_otps` collection (TTL index removes expired docs).
+#   3. Email channel: send OTP via Emergent Resend (transactional, guardrailed).
+#      SMS channel: OTP is stored & logged; the admin can hand it over via
+#      support until an SMS provider is wired. Same response either way — we
+#      never reveal whether the email exists (enumeration defence).
+#   4. User calls /auth/reset-password with {email, otp, new_password}.
+#      Verifies OTP hash, increments attempts (max 5), sets new password.
+
+import secrets
+import email_service
+
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+    channel: str = "email"  # "email" | "sms"
+
+
+class ResetPasswordRequest(BaseModel):
+    email: EmailStr
+    otp: str
+    new_password: str
+
+
+OTP_TTL_MINUTES = 15
+OTP_MAX_ATTEMPTS = 5
+
+
+@api_router.post("/auth/forgot-password")
+async def forgot_password(body: ForgotPasswordRequest):
+    """Issue a 6-digit OTP for password reset. Always returns success shape,
+    even when the email is not registered (prevents enumeration)."""
+    email = body.email.lower().strip()
+    channel = (body.channel or "email").lower()
+    if channel not in ("email", "sms"):
+        raise HTTPException(status_code=400, detail="channel must be 'email' or 'sms'")
+
+    generic_ok = {"message": "If that account exists, a code has been sent.", "channel": channel}
+    user = await db.users.find_one({"email": email})
+    if not user:
+        return generic_ok
+
+    # Rate limit: no more than one active OTP per email in the last 60s
+    now = datetime.now(timezone.utc)
+    recent = await db.password_reset_otps.find_one({
+        "email": email,
+        "created_at": {"$gt": now - timedelta(seconds=60)},
+    })
+    if recent:
+        return generic_ok
+
+    otp = f"{secrets.randbelow(1_000_000):06d}"
+    otp_hash = hash_password(otp)  # bcrypt — same helper the app already uses
+
+    await db.password_reset_otps.delete_many({"email": email})  # invalidate old ones
+    await db.password_reset_otps.insert_one({
+        "email": email,
+        "otp_hash": otp_hash,
+        "channel": channel,
+        "attempts": 0,
+        "created_at": now,
+        "expires_at": now + timedelta(minutes=OTP_TTL_MINUTES),
+    })
+
+    if channel == "email":
+        try:
+            subject, html = email_service.render_password_reset_otp(
+                user_name=user.get("name") or "there",
+                otp=otp,
+                ttl_minutes=OTP_TTL_MINUTES,
+            )
+            await email_service.send_email(to=email, subject=subject, html=html)
+            logger.info(f"password-reset OTP emailed to {email}")
+        except Exception as e:
+            logger.error(f"password-reset OTP email send failed for {email}: {e}")
+            # Do not leak provider failures to the caller
+    else:
+        # SMS channel: no provider wired yet — log the OTP for support staff and
+        # store `pending_delivery=True` so an operator/dashboard integration
+        # can pick it up later. Never returned to the client.
+        await db.password_reset_otps.update_one(
+            {"email": email}, {"$set": {"pending_delivery": True, "mobile_number": user.get("mobile_number")}}
+        )
+        logger.warning(
+            f"password-reset OTP (SMS channel) for {email} → mobile={user.get('mobile_number')} "
+            f"OTP={otp} — SMS provider not configured; deliver via support."
+        )
+
+    return generic_ok
+
+
+@api_router.post("/auth/reset-password")
+async def reset_password(body: ResetPasswordRequest):
+    """Verify OTP and set a new password."""
+    email = body.email.lower().strip()
+    if not body.otp or len(body.otp.strip()) < 4:
+        raise HTTPException(status_code=400, detail="Invalid code")
+    if not body.new_password or len(body.new_password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+
+    rec = await db.password_reset_otps.find_one({"email": email})
+    if not rec:
+        raise HTTPException(status_code=400, detail="Invalid or expired code")
+
+    if _as_utc(rec.get("expires_at")) and _as_utc(rec["expires_at"]) < datetime.now(timezone.utc):
+        await db.password_reset_otps.delete_one({"_id": rec["_id"]})
+        raise HTTPException(status_code=400, detail="Code has expired. Request a new one.")
+
+    if rec.get("attempts", 0) >= OTP_MAX_ATTEMPTS:
+        await db.password_reset_otps.delete_one({"_id": rec["_id"]})
+        raise HTTPException(status_code=429, detail="Too many attempts. Request a new code.")
+
+    if not verify_password(body.otp.strip(), rec["otp_hash"]):
+        await db.password_reset_otps.update_one({"_id": rec["_id"]}, {"$inc": {"attempts": 1}})
+        raise HTTPException(status_code=400, detail="Invalid code")
+
+    # OTP is valid — set new password, delete OTP row, invalidate any other pending ones
+    new_hash = hash_password(body.new_password)
+    await db.users.update_one({"email": email}, {"$set": {"password_hash": new_hash}})
+    await db.password_reset_otps.delete_many({"email": email})
+    logger.info(f"password reset completed for {email}")
+    return {"message": "Password reset successful. Please sign in with your new password."}
+
+
 @api_router.post("/auth/login")
 async def login(credentials: UserLogin):
     """Login with email/password"""
@@ -1227,23 +1358,52 @@ async def upload_video_chunk(
     except Exception as e:
         logger.warning(f"ffprobe metadata extraction failed for {video_id}: {e}")
 
-    # ==== Kick off background transcode if resolution qualifies ====
+    # ==== Kick off background transcode ====
+    #
+    # Auto pre-transcode: even if the resolution is fine, we still normalize
+    # the video to our exact YouTube-Live spec (h264/aac/2s GOP/CBR/CFR) so
+    # every future live push can use `-c copy` (near-zero CPU) and never
+    # trip the "not receiving enough video" buffering alert. We only skip
+    # when the source is *already* fully conformant.
+    v_codec, a_codec = youtube_service._probe_codecs(str(final_path))
+    gop_s = youtube_service._probe_gop_seconds(str(final_path)) if (v_codec == "h264" and a_codec == "aac") else 99.0
+    is_stream_copy_safe = (v_codec == "h264" and a_codec == "aac" and gop_s <= 2.5)
+
     target = _target_height(height)
+    needs_downscale = bool(target and target != height)
+    # If already conformant AND no downscale needed → nothing to do.
+    # Otherwise transcode: downscale to `target` if set, else re-encode at
+    # current height (`height or 720`) to normalize codec/GOP.
     processing_status = "completed"
-    if target and target != height:
-        # Mark the doc so the UI can show "Processing…"
+    if needs_downscale or not is_stream_copy_safe:
+        normalize_only = (not needs_downscale) and (not is_stream_copy_safe)
+        effective_target = target if needs_downscale else (height or 720)
         await db.videos.update_one(
             {"video_id": video_id},
             {"$set": {
                 "processing_status": "transcoding",
-                "transcode_target": f"{target}p",
+                "transcode_target": f"{effective_target}p",
+                "transcode_reason": "downscale+normalize" if needs_downscale else "normalize_only",
                 "original_height": height,
                 "original_size": file_size,
+                "src_v_codec": v_codec,
+                "src_a_codec": a_codec,
+                "src_gop_seconds": gop_s if gop_s < 90 else None,
             }}
         )
         processing_status = "transcoding"
-        schedule_transcode(video_id, user["user_id"], str(final_path), target)
-        logger.info(f"Scheduled transcode for {video_id}: {height}p → {target}p")
+        schedule_transcode(video_id, user["user_id"], str(final_path), effective_target)
+        logger.info(
+            f"Scheduled transcode for {video_id}: {height}p → {effective_target}p "
+            f"(reason={'downscale+normalize' if needs_downscale else 'normalize_only'}, "
+            f"src_codecs=v:{v_codec}/a:{a_codec} gop={gop_s})"
+        )
+    else:
+        logger.info(f"Video {video_id} already stream-copy-safe (h264/aac/gop={gop_s:.1f}s); skipping transcode")
+        await db.videos.update_one(
+            {"video_id": video_id},
+            {"$set": {"processing_status": "completed", "src_v_codec": v_codec, "src_a_codec": a_codec}}
+        )
 
     return {
         "status": "completed",
@@ -2169,6 +2329,12 @@ async def startup_event():
     await db.videos.create_index("user_id")
     # Speeds up multi-slot count/list queries.
     await db.live_streams.create_index("user_id")
+    # TTL index: MongoDB auto-deletes expired OTP rows via `expires_at`.
+    try:
+        await db.password_reset_otps.create_index("expires_at", expireAfterSeconds=0)
+        await db.password_reset_otps.create_index("email")
+    except Exception as e:
+        logger.warning(f"otp indexes: {e}")
 
     # One-time migration: backfill stream_id on any legacy live_streams docs
     # (docs created before iter-9 didn't have this field, which crashed the
@@ -2445,6 +2611,180 @@ async def startup_event():
             await asyncio.sleep(30)
 
     asyncio.create_task(_plan_expiry_sweep_loop())
+
+    # ---------- Ingest health watchdog -----------------------------------------
+    # Parses each live stream's ffmpeg log every 30 s. If ffmpeg is falling
+    # behind wall-clock (speed<0.9 for 3 consecutive checks) OR the log stops
+    # growing for >60 s, we log a warning and mark the DB row for admin
+    # visibility. A future revision can auto-restart the stream at a lower
+    # bitrate; for now we surface the signal, since a false-positive restart
+    # is worse than a warning line.
+    _ingest_state: dict[str, dict] = {}   # stream_id → {"slow": int, "log_mtime": float}
+
+    def _tail_bytes(path: str, n: int = 4096) -> str:
+        try:
+            with open(path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(0, size - n))
+                return f.read().decode(errors="ignore")
+        except Exception:
+            return ""
+
+    async def _ingest_watchdog_loop():
+        speed_re = re.compile(r"speed=\s*([0-9.]+)x")
+        drop_re = re.compile(r"drop=\s*(\d+)")
+        while True:
+            try:
+                live_streams = await db.live_streams.find({"is_live": True}).to_list(200)
+                seen_ids = set()
+                for s in live_streams:
+                    sid = s.get("stream_id")
+                    key = s.get("stream_key") or ""
+                    if not sid or not key:
+                        continue
+                    seen_ids.add(sid)
+                    # Find the most-recent log for this stream_key
+                    log_dir = "/var/log/live-adda/ffmpeg"
+                    if not os.path.isdir(log_dir):
+                        log_dir = "/tmp"
+                    prefix = f"ffmpeg_{key[:8]}_"
+                    try:
+                        candidates = sorted(
+                            (p for p in os.listdir(log_dir) if p.startswith(prefix)),
+                            reverse=True,
+                        )
+                    except FileNotFoundError:
+                        candidates = []
+                    if not candidates:
+                        continue
+                    log_path = os.path.join(log_dir, candidates[0])
+                    st = _ingest_state.setdefault(sid, {"slow": 0, "log_mtime": 0.0, "last_drop": 0})
+
+                    # Frozen-log detection
+                    try:
+                        mtime = os.path.getmtime(log_path)
+                    except OSError:
+                        continue
+                    if st["log_mtime"] and (time.time() - mtime) > 60:
+                        logger.warning(
+                            f"watchdog: stream {sid} log frozen "
+                            f"({int(time.time() - mtime)}s stale) — encoder may be stuck"
+                        )
+                        await db.live_streams.update_one(
+                            {"_id": s["_id"]},
+                            {"$set": {"ingest_health": "frozen", "ingest_checked_at": datetime.now(timezone.utc)}},
+                        )
+                        continue
+                    st["log_mtime"] = mtime
+
+                    tail = _tail_bytes(log_path, 4096)
+                    speeds = [float(m.group(1)) for m in speed_re.finditer(tail)]
+                    drops = [int(m.group(1)) for m in drop_re.finditer(tail)]
+                    latest_speed = speeds[-1] if speeds else None
+                    latest_drop = drops[-1] if drops else 0
+
+                    if latest_speed is not None and latest_speed < 0.9:
+                        st["slow"] += 1
+                    else:
+                        st["slow"] = 0
+
+                    drop_delta = latest_drop - st.get("last_drop", 0)
+                    st["last_drop"] = latest_drop
+
+                    health = "ok"
+                    if st["slow"] >= 3:
+                        health = "cpu_throttled"
+                        logger.warning(
+                            f"watchdog: stream {sid} CPU-throttled — speed={latest_speed}x "
+                            f"for {st['slow']} checks (bitrate too high or CPU saturated)"
+                        )
+                    elif drop_delta > 30:
+                        health = "dropping_frames"
+                        logger.warning(
+                            f"watchdog: stream {sid} dropped {drop_delta} frames in 30s "
+                            f"(total drop={latest_drop}) — network or ingest issue"
+                        )
+
+                    await db.live_streams.update_one(
+                        {"_id": s["_id"]},
+                        {"$set": {
+                            "ingest_health": health,
+                            "ingest_speed": latest_speed,
+                            "ingest_dropped_frames": latest_drop,
+                            "ingest_checked_at": datetime.now(timezone.utc),
+                        }},
+                    )
+
+                # Purge state entries for streams that ended
+                for stale in set(_ingest_state.keys()) - seen_ids:
+                    _ingest_state.pop(stale, None)
+            except Exception as e:
+                logger.warning(f"ingest watchdog loop error: {e}")
+            await asyncio.sleep(30)
+
+    asyncio.create_task(_ingest_watchdog_loop())
+
+    # ---------- Plan-expiry reminder broadcast (WhatsApp alternative) ----------
+    # Fires an in-app broadcast to any user whose (soonest) active plan expires
+    # in 20-28h. Uses the existing `notifications` collection so the banner
+    # `NotificationBanner.jsx` already renders in the dashboard picks it up.
+    # We dedupe per-user-per-plan-expiry so a user never sees the same nudge twice.
+    async def _plan_expiry_reminder_loop():
+        while True:
+            try:
+                now = datetime.now(timezone.utc)
+                window_start = now + timedelta(hours=20)
+                window_end = now + timedelta(hours=28)
+                # Users on lifetime never expire; only look at users with active_plans
+                cursor = db.users.find({
+                    "plan": {"$ne": "lifetime"},
+                    "active_plans": {"$exists": True, "$ne": []},
+                })
+                async for u in cursor:
+                    live_entries = _active_entries(u)
+                    if not live_entries:
+                        continue
+                    soonest = min(live_entries, key=lambda e: e["expires_at"])
+                    exp = soonest["expires_at"]
+                    if not (window_start <= exp <= window_end):
+                        continue
+                    # Dedupe: skip if we already stored a reminder for this user+exp
+                    exp_key = exp.isoformat()
+                    dup = await db.notifications.find_one({
+                        "kind": "plan_reminder",
+                        "user_id": u["user_id"],
+                        "plan_expires_at": exp_key,
+                    })
+                    if dup:
+                        continue
+                    remaining_hours = int((exp - now).total_seconds() // 3600)
+                    doc = {
+                        "notification_id": f"note_{uuid.uuid4().hex[:12]}",
+                        "kind": "plan_reminder",
+                        "user_id": u["user_id"],   # user-targeted, not broadcast
+                        "plan_expires_at": exp_key,
+                        "title": f"Your plan expires in ~{remaining_hours}h",
+                        "body": (
+                            f"Hi {u.get('name') or 'there'}, your {soonest.get('plan_id') or 'current'} "
+                            f"plan expires soon. Renew before the timer runs out so your "
+                            f"videos stay online and your stream doesn't drop."
+                        ),
+                        "audience": "user",
+                        "severity": "warning",
+                        "created_by": "system",
+                        "created_at": now,
+                        "active": True,
+                    }
+                    await db.notifications.insert_one(doc)
+                    logger.info(f"plan-reminder: queued for user={u['user_id']} expires_in={remaining_hours}h")
+            except Exception as e:
+                logger.warning(f"plan expiry reminder loop error: {e}")
+            # Runs every hour — window is 8h wide so we can't miss anyone,
+            # dedupe key guarantees at most one nudge per user per plan-expiry.
+            await asyncio.sleep(3600)
+
+    asyncio.create_task(_plan_expiry_reminder_loop())
 
 # ==================== ADMIN DASHBOARD ====================
 #

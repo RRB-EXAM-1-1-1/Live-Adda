@@ -211,6 +211,35 @@ Build "Live Adda" - a professional 24/7 YouTube Live streaming SaaS platform.
 
 
 
+## Auto Pre-Transcode + Ingest Watchdog + Plan Reminder + Password Reset (2026-07)
+
+**1. Auto Pre-Transcode Every Upload** (`server.py` finalize-upload path)
+- After ffprobe extracts codecs, we now probe GOP length too (`youtube_service._probe_gop_seconds`).
+- Transcode is triggered when EITHER (a) resolution needs downscaling, OR (b) source isn't stream-copy-safe (not h264, not aac, or GOP > 2.5 s).
+- If only normalization is needed we transcode at the source's current height with the same YouTube-Live spec (h264/aac/2s-GOP/CBR/CFR/high@4.1). Every future live push on that video hits `-c copy` (near-zero CPU).
+- DB row records `transcode_reason` (`downscale+normalize` | `normalize_only`) + `src_v_codec` + `src_a_codec` + `src_gop_seconds` for admin visibility.
+
+**2. Ingest Health Watchdog** (`_ingest_watchdog_loop` in startup, every 30 s)
+- Parses each live stream's ffmpeg log tail for `speed=X.XXx` and `drop=N`.
+- Flags stream `ingest_health="cpu_throttled"` when speed<0.9 for 3 consecutive checks; `dropping_frames` when >30 dropped in a 30-s window; `frozen` when the log stops growing for >60 s.
+- Writes `ingest_health`, `ingest_speed`, `ingest_dropped_frames`, `ingest_checked_at` on the live_streams row so the admin dashboard can surface it (existing table can render these fields; UI can be added when needed).
+- Deliberately does NOT auto-restart streams yet — false-positive restart is worse than a warning. Log line + DB flag first; auto-restart can be added once we've seen the signal quality in production.
+
+**3. Plan-Expiry Reminder** (`_plan_expiry_reminder_loop`, every 1 h)
+- For every non-lifetime user whose earliest active plan expires in 20–28 h, inserts a targeted `notifications` row with `kind="plan_reminder"`, `audience="user"`, `severity="warning"`.
+- Deduped by (`user_id`, `plan_expires_at`) so a user sees at most one nudge per plan expiry.
+- Rendered by the existing `NotificationBanner.jsx` — no WhatsApp/SMS provider needed. Mobile numbers we now collect at signup are stored on the OTP row too, ready for a future SMS provider swap.
+
+**4. Password Reset (OTP-based)**
+- New module `/app/backend/email_service.py` — Emergent-managed Resend transactional sender with the full G1–G5 guardrail gate, plus `render_password_reset_otp()` server-side template.
+- New endpoints:
+  - `POST /api/auth/forgot-password` — accepts `{email, channel: "email"|"sms"}`; generates 6-digit OTP; stores bcrypt hash + attempts + `expires_at` in `password_reset_otps` (TTL-indexed); rate-limits to 1 OTP/60 s per email; **always returns generic ok shape** (no enumeration).
+  - `POST /api/auth/reset-password` — validates OTP with bcrypt + attempt cap (5) + TTL, sets new password, wipes all OTP rows for that email.
+- Email channel: OTP sent via Resend, 202 verified in logs (`https://integrations.emergentagent.com/api/v1/email/send`).
+- SMS channel: no provider wired yet — OTP logged for support handoff, `mobile_number` + `pending_delivery=true` stored on the row so a future SMS provider integration is a drop-in.
+- Frontend: new `ForgotPassword.jsx` (`/forgot-password` route) — 3-step wizard (channel picker + email → OTP + new pw → success). "Forgot password?" link added below the login password field.
+- End-to-end verified via curl: register → forgot(sms channel logs OTP) → reset → login-with-new-password ✓ → login-with-old fails ✓. Enumeration guard confirmed (unknown email + known email return identical bodies).
+
 ## Process Management + Queue Robustness (2026-07)
 
 User asked for "PM2 + BullMQ/Redis" — both are Node-only, but the Python
