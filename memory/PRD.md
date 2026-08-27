@@ -211,6 +211,26 @@ Build "Live Adda" - a professional 24/7 YouTube Live streaming SaaS platform.
 
 
 
+## Process Management + Queue Robustness (2026-07)
+
+User asked for "PM2 + BullMQ/Redis" — both are Node-only, but the Python
+equivalents are already in place. Fixed one latent bug and hardened the setup:
+
+- **Supervisor config**: switched `--workers 2` → `--workers 1` (avoids
+  duplicate reaper/sweeper loops and split-semaphore transcodes),
+  `startretries 3 → 5`, added `startsecs`, `stopsignal=TERM`,
+  25MB × 5 log rotation. Same file also referenced by both setup and update.
+- **`systemctl enable supervisor`** now enforced by both `setup.sh` and
+  `update.sh` so the app auto-starts after a droplet reboot.
+- **`start_ffmpeg_push` hardening**: fails fast with `FileNotFoundError` if
+  source missing, waits 1.2 s and returns `RuntimeError` with stderr tail if
+  ffmpeg dies at spawn (bad key/DNS/codec). Callers translate to HTTP 410/500.
+- **Persistent ffmpeg logs** at `/var/log/live-adda/ffmpeg/ffmpeg_<key>_<ts>.log`
+  (falls back to `/tmp` on preview/dev).
+- **Doc**: new `/app/deploy/README-process-management.md` — full mapping of
+  PM2/BullMQ features → Python-native equivalents, operational commands,
+  when to upgrade to arq/Redis (spoiler: not yet).
+
 ## Clickable Analytics Cards + Admin Video Delete + Instant Auto-Purge + Mobile Signup (2026-07)
 
 **Backend (`server.py`)**

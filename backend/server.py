@@ -2009,8 +2009,15 @@ async def start_stream_with_key(data: StreamKeyStart, user: dict = Depends(get_c
 
     try:
         pid = youtube_service.start_ffmpeg_push(video["file_path"], stream_key, loop=data.loop)
+    except FileNotFoundError as e:
+        logger.error(f"Stream start failed — source video missing: {e}")
+        raise HTTPException(status_code=410, detail="The source video file was removed. Re-upload and try again.")
+    except RuntimeError as e:
+        # ffmpeg died within 1.2s of spawn — bad key, DNS fail, codec issue.
+        logger.error(f"Stream start failed — ffmpeg crashed at spawn: {e}")
+        raise HTTPException(status_code=500, detail="Encoder failed to start. Check your stream key or contact support.")
     except Exception as e:
-        logger.error(f"Failed to start ffmpeg with key: {e}")
+        logger.error(f"Stream start failed — unexpected: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to start the video encoder.")
 
     stream_id = f"stream_{uuid.uuid4().hex[:12]}"

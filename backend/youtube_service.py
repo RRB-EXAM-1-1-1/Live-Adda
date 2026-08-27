@@ -261,7 +261,17 @@ def start_ffmpeg_push(video_path: str, stream_key: str, loop: bool = True) -> in
 
     Both paths spawn in their own process group so `stop_ffmpeg_push` can
     take the whole tree down cleanly (no zombies, instant CPU release).
+
+    Raises FileNotFoundError if the source is missing. Raises RuntimeError if
+    ffmpeg dies within the first second (usually means bad codec/key/network).
     """
+    # Fail fast + loud when the file is missing — otherwise ffmpeg would emit
+    # a cryptic "No such file" into a log the operator will never look at.
+    if not video_path or not os.path.exists(video_path):
+        raise FileNotFoundError(f"Video source not found on disk: {video_path}")
+    if not stream_key:
+        raise ValueError("stream_key is empty")
+
     rtmp_url = f"{RTMP_BASE}/{stream_key}"
     v_codec, a_codec = _probe_codecs(video_path)
     codec_ok = (v_codec == "h264" and a_codec == "aac")
@@ -319,7 +329,14 @@ def start_ffmpeg_push(video_path: str, stream_key: str, loop: bool = True) -> in
     # RTMP endpoints reject the default duration/size headers on infinite streams.
     cmd += ["-f", "flv", "-flvflags", "no_duration_filesize", rtmp_url]
 
-    log_path = f"/tmp/ffmpeg_{stream_key[:8]}.log"
+    # Persistent log location. Tries /var/log/live-adda first (production),
+    # falls back to /tmp so dev/preview still works.
+    log_dir = "/var/log/live-adda/ffmpeg"
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+    except (PermissionError, OSError):
+        log_dir = "/tmp"
+    log_path = f"{log_dir}/ffmpeg_{stream_key[:8]}_{int(time.time())}.log"
     logf = open(log_path, "wb")
     # start_new_session=True → new process group, so os.killpg reaches every
     # child ffmpeg spawns (filters, muxers, etc.) and nothing is left behind.
@@ -327,11 +344,33 @@ def start_ffmpeg_push(video_path: str, stream_key: str, loop: bool = True) -> in
         cmd, stdout=logf, stderr=logf, stdin=subprocess.DEVNULL,
         start_new_session=True,
     )
+
+    # Health check: give ffmpeg 1.2 s to survive. If it exits inside that
+    # window it means the command was invalid (bad codec, bad key, DNS fail).
+    # We surface the last 300 bytes of stderr so the caller can log a useful
+    # error instead of a silent 500.
+    time.sleep(1.2)
+    rc = proc.poll()
+    if rc is not None:
+        # Read the tail of the log for context
+        tail = ""
+        try:
+            with open(log_path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(0, size - 400))
+                tail = f.read().decode(errors="ignore").strip()
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"ffmpeg exited immediately (rc={rc}). Tail: {tail[-300:]}"
+        )
+
     with _procs_lock:
         _running_procs[proc.pid] = proc
     logger.info(
         f"Started ffmpeg push PID={proc.pid} mode={mode} "
-        f"src_codecs=v:{v_codec}/a:{a_codec} -> {RTMP_BASE}/***"
+        f"src_codecs=v:{v_codec}/a:{a_codec} log={log_path} -> {RTMP_BASE}/***"
     )
     return proc.pid
 

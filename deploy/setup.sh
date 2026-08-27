@@ -124,6 +124,8 @@ mkdir -p /var/log/live-adda
 sed "s|/opt/live-adda|${INSTALL_DIR}|g" "$INSTALL_DIR/deploy/supervisor-backend.conf" > /etc/supervisor/conf.d/live-adda-backend.conf
 supervisorctl reread && supervisorctl update
 supervisorctl restart live-adda-backend || supervisorctl start live-adda-backend
+# Enable supervisor to auto-start on server reboot (equivalent of `pm2 startup`).
+systemctl enable supervisor >/dev/null 2>&1 || true
 
 echo "==> [8/9] Configuring Nginx..."
 sed -e "s|YOUR_DROPLET_IP|${DOMAIN}|g" -e "s|/opt/live-adda|${INSTALL_DIR}|g" \

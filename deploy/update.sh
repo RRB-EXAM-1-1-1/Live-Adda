@@ -49,6 +49,14 @@ pip install -r requirements.txt
 # NOTE: emergentintegrations/litellm are Emergent-internal and intentionally NOT
 # in requirements.txt. Stripe endpoints degrade gracefully if the module is absent.
 
+# Ensure supervisor autostarts on OS reboot (idempotent — no-op if already enabled).
+# Also refresh the supervisor unit in case we tweaked worker count, log rotation, etc.
+mkdir -p /var/log/live-adda
+systemctl enable supervisor >/dev/null 2>&1 || true
+sed "s|/opt/live-adda|${INSTALL_DIR}|g" "$INSTALL_DIR/deploy/supervisor-backend.conf" > /etc/supervisor/conf.d/live-adda-backend.conf
+supervisorctl reread >/dev/null 2>&1 || true
+supervisorctl update >/dev/null 2>&1 || true
+
 echo "    Checking required env vars in backend/.env ..."
 MISSING=0
 for VAR in RAZORPAY_KEY_ID RAZORPAY_KEY_SECRET PUBLIC_APP_URL; do
