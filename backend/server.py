@@ -85,8 +85,15 @@ async def transcode_video_background(video_id: str, user_id: str, source_path: s
             proc = await asyncio.create_subprocess_exec(
                 "ffmpeg", "-y", "-i", str(src),
                 "-vf", f"scale=-2:{target_height}",  # -2 keeps even width for H.264
+                "-r", "30",                          # force CFR — YouTube live requires constant frame rate
                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-                "-c:a", "aac", "-b:a", "128k",
+                "-profile:v", "high", "-level", "4.1",
+                "-pix_fmt", "yuv420p",
+                # 2-second keyframe interval @ 30 fps. YouTube's #1 stability
+                # requirement — without this, `-c copy` streaming triggers
+                # "not receiving enough video" buffering alerts.
+                "-g", "60", "-keyint_min", "60", "-sc_threshold", "0",
+                "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
                 "-movflags", "+faststart",
                 str(tmp_out),
                 stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,

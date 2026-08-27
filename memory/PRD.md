@@ -211,6 +211,21 @@ Build "Live Adda" - a professional 24/7 YouTube Live streaming SaaS platform.
 
 
 
+## YouTube Live Smooth Ingest (2026-07)
+Fixes the "YouTube is not receiving enough video to maintain smooth streaming" alert. Every flag below is defensible: it's either a documented YouTube-live requirement or a fix for a real cause of RTMP-side buffering.
+
+**youtube_service.py — `start_ffmpeg_push`:**
+- Switched endpoint from `rtmp://a.rtmp.youtube.com/live2` → `rtmps://a.rtmp.youtube.com/live2` (survives firewalls/DPI that drop plain RTMP packets).
+- Added `_probe_gop_seconds()` — measures average keyframe distance in the first 30 s. Stream-copy is now allowed ONLY when source is h264+aac AND GOP ≤ 2.5 s. Everything else re-encodes.
+- Re-encode path is now true **CBR at 1800 kbps** (`-b:v -minrate -maxrate` all equal, `-bufsize 3600k`, `-x264-params nal-hrd=cbr:force-cfr=1`). Fixes bursty output that starved the RTMP socket.
+- Forced 2-second GOP (`-g 60 -keyint_min 60 -sc_threshold 0`) — the single biggest cause of the "not receiving enough video" alert.
+- Constant frame rate: `-r 30 -pix_fmt yuv420p -profile:v high -level 4.1`, audio locked to `-ar 44100 -ac 2`.
+- Timestamp normalization: `-fflags +genpts -avoid_negative_ts make_zero -af aresample=async=1` — eliminates loop-boundary drift and PTS glitches in user uploads.
+- FLV muxer flag: `-flvflags no_duration_filesize` — cleaner header for an infinite live stream.
+
+**server.py — `transcode_video_background`:**
+- Added the same `-g 60 -keyint_min 60 -sc_threshold 0 -r 30 -profile:v high -level 4.1 -pix_fmt yuv420p -ar 44100 -ac 2` so every video we transcode is directly "stream-copy safe" for YouTube Live. Next stream on that video pays zero CPU AND cannot trip the buffering alert.
+
 ## Instant CPU Cleanup on Stream/Plan End (2026-07)
 Previously the "stop ffmpeg" logic only fired when the user hit an API. If someone paid for a Daily plan, started a stream, then closed their browser, the encoder kept burning ~100% CPU past hour 24 because nothing was calling `check_active_plan`. Added:
 - **Reaper loop (every 15 s)** — catches ffmpeg that died on its own, marks DB row `is_live=False, stopped_reason="ffmpeg_exited"`.

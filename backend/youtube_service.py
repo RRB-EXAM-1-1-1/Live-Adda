@@ -28,8 +28,10 @@ YOUTUBE_SCOPES = [
     "https://www.googleapis.com/auth/youtube.readonly",
 ]
 
-# YouTube RTMP ingestion base
-RTMP_BASE = "rtmp://a.rtmp.youtube.com/live2"
+# YouTube RTMP ingestion base. RTMPS is preferred: it survives firewalls/DPI
+# that occasionally drop bare RTMP packets and causes the "not receiving enough
+# video" alert. YouTube accepts the same stream key on both.
+RTMP_BASE = "rtmps://a.rtmp.youtube.com/live2"
 
 
 def is_configured() -> bool:
@@ -204,42 +206,118 @@ def _probe_codecs(video_path: str) -> "tuple[str | None, str | None]":
         return None, None
 
 
-def start_ffmpeg_push(video_path: str, stream_key: str, loop: bool = True) -> int:
-    """Start an ffmpeg process pushing the given local video to YouTube RTMP.
+def _probe_gop_seconds(video_path: str) -> float:
+    """Measure the average distance (in seconds) between video keyframes in
+    the first ~30s of the file. YouTube requires ≤2s (with 4s as absolute max)
+    to keep live latency low and avoid rebuffering. Returns 99.0 if we can't
+    tell — caller will treat that as "unsafe for -c copy" and force re-encode.
+    """
+    try:
+        out = subprocess.check_output(
+            [
+                "ffprobe", "-v", "error", "-read_intervals", "%+30",
+                "-select_streams", "v:0",
+                "-show_entries", "packet=pts_time,flags",
+                "-of", "csv=p=0", video_path,
+            ],
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+        ).decode(errors="ignore")
+    except Exception as e:
+        logger.warning(f"gop probe failed for {video_path}: {e}")
+        return 99.0
+    key_times: list[float] = []
+    for line in out.splitlines():
+        parts = line.split(",")
+        if len(parts) < 2:
+            continue
+        pts, flags = parts[0], parts[1]
+        if "K" in flags:
+            try:
+                key_times.append(float(pts))
+            except ValueError:
+                continue
+    if len(key_times) < 2:
+        return 99.0
+    diffs = [b - a for a, b in zip(key_times, key_times[1:])]
+    return sum(diffs) / len(diffs) if diffs else 99.0
 
-    CPU optimizations for shared 2 vCPU droplet:
-      1. If the source is already h264+aac (YouTube-compatible), use `-c copy`
-         so no re-encoding happens (near-zero CPU).
-      2. Otherwise re-encode with `-preset ultrafast` and a 1200k target
-         bitrate (matches 720p reasonably, avoids CPU throttling blur).
-      3. Spawn in its own process group so we can SIGTERM/SIGKILL the whole
-         group on stop and never leak orphaned encoders.
+
+def start_ffmpeg_push(video_path: str, stream_key: str, loop: bool = True) -> int:
+    """Start an ffmpeg process pushing the given local video to YouTube RTMPS.
+
+    Two modes, chosen automatically:
+
+    * **Stream-copy** (`-c copy`, near-zero CPU) — only used when the source is
+      already h264+aac AND its keyframes land ≤2.5s apart. YouTube live
+      requires a keyframe every ~2s; any longer and viewers see the
+      "not receiving enough video" buffering alert.
+
+    * **Re-encode** (`-preset ultrafast`) — used for everything else. Emits
+      a constant bitrate (CBR) stream with a hard-forced 2-second GOP,
+      constant frame rate, and normalized timestamps. These are the specific
+      flags YouTube's live-encoder guidelines call out as required for a
+      stable ingest.
+
+    Both paths spawn in their own process group so `stop_ffmpeg_push` can
+    take the whole tree down cleanly (no zombies, instant CPU release).
     """
     rtmp_url = f"{RTMP_BASE}/{stream_key}"
     v_codec, a_codec = _probe_codecs(video_path)
-    can_copy = (v_codec == "h264" and a_codec == "aac")
+    codec_ok = (v_codec == "h264" and a_codec == "aac")
+    can_copy = False
+    gop_s = None
+    if codec_ok:
+        gop_s = _probe_gop_seconds(video_path)
+        can_copy = gop_s <= 2.5
 
-    cmd: list[str] = ["ffmpeg", "-re"]
+    # Common input + timing flags. `-re` paces reads at native frame rate so
+    # we don't flood YouTube; `-fflags +genpts` and `-avoid_negative_ts` fix
+    # broken PTS from user uploads that otherwise cause ingest desyncs.
+    cmd: list[str] = [
+        "ffmpeg",
+        "-fflags", "+genpts",
+        "-avoid_negative_ts", "make_zero",
+        "-re",
+    ]
     if loop:
         cmd += ["-stream_loop", "-1"]
     cmd += ["-i", video_path]
 
     if can_copy:
-        # Zero-encode passthrough. YouTube accepts this as-is.
-        cmd += ["-c", "copy", "-bsf:a", "aac_adtstoasc"]
-        mode = "copy"
-    else:
-        # Ultrafast preset trades a bit of compression efficiency for a
-        # large CPU drop — right call on a 2 vCPU box under contention.
+        # Zero-encode passthrough. `aac_adtstoasc` fixes AAC framing for FLV.
         cmd += [
-            "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-            "-b:v", "1200k", "-maxrate", "1500k", "-bufsize", "3000k",
-            "-pix_fmt", "yuv420p", "-g", "60",
-            "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+            "-c", "copy",
+            "-bsf:a", "aac_adtstoasc",
         ]
-        mode = "reencode-ultrafast"
+        mode = f"copy (gop≈{gop_s:.1f}s)"
+    else:
+        # CBR + fixed 2-second GOP + CFR — the trifecta that stops YouTube's
+        # "buffering" alerts. `-tune zerolatency` keeps encoder buffers small
+        # so packets leave promptly instead of bunching up.
+        cmd += [
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-tune", "zerolatency",
+            "-profile:v", "high", "-level", "4.1",
+            "-pix_fmt", "yuv420p",
+            "-r", "30",
+            # Fixed GOP: keyframe every 60 frames (2 s @ 30 fps). `sc_threshold=0`
+            # blocks scene-cut keyframes from breaking the cadence.
+            "-g", "60", "-keyint_min", "60", "-sc_threshold", "0",
+            # True CBR — RTMP smoothness needs steady bytes/sec, not VBR bursts.
+            "-b:v", "1800k", "-minrate", "1800k", "-maxrate", "1800k",
+            "-bufsize", "3600k",
+            "-x264-params", "nal-hrd=cbr:force-cfr=1",
+            "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
+            # Resamples audio so loop-boundary jitter doesn't drift out of sync.
+            "-af", "aresample=async=1",
+        ]
+        mode = f"reencode-ultrafast (src gop={gop_s})"
 
-    cmd += ["-f", "flv", rtmp_url]
+    # `-flvflags no_duration_filesize` — cleaner FLV framing for live; some
+    # RTMP endpoints reject the default duration/size headers on infinite streams.
+    cmd += ["-f", "flv", "-flvflags", "no_duration_filesize", rtmp_url]
 
     log_path = f"/tmp/ffmpeg_{stream_key[:8]}.log"
     logf = open(log_path, "wb")
