@@ -2136,6 +2136,24 @@ async def start_stream_with_key(data: StreamKeyStart, user: dict = Depends(get_c
     Enforces the user's concurrent-stream slot budget (default 1, admin lifetime = 3)."""
     await check_active_plan(user)
 
+    # Fail-fast overload guard: if the box is already saturated, reject new
+    # starts instead of crashing existing streams. Load-avg is per-core-normalized
+    # so we compare to CPU_COUNT * 0.85 (85 % headroom trigger).
+    try:
+        load_1m = os.getloadavg()[0]
+        cpu_count = os.cpu_count() or 1
+        if load_1m > cpu_count * 0.85:
+            logger.warning(
+                f"stream start rejected — load={load_1m:.2f} on {cpu_count} cores "
+                f"(user={user.get('email')})"
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Server is at capacity — please retry in ~30 seconds.",
+            )
+    except (OSError, AttributeError):
+        pass  # getloadavg unavailable on some kernels/OSes — proceed
+
     stream_key = data.stream_key.strip()
     if not stream_key:
         raise HTTPException(status_code=400, detail="Stream key is required")
@@ -3158,6 +3176,72 @@ async def admin_delete_broadcast(notification_id: str, admin: dict = Depends(get
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Broadcast not found")
     return {"message": "Broadcast deleted"}
+
+
+@api_router.post("/admin/videos/{video_id}/normalize")
+async def admin_normalize_video(video_id: str, admin: dict = Depends(get_admin_user)):
+    """Force-re-transcode a specific video to our YouTube-Live spec
+    (h264/aac/2s-GOP/CBR/CFR). The next live push on it will use `-c copy`
+    at near-zero CPU. Use this to pre-cook demo/promo videos before events."""
+    video = await db.videos.find_one({"video_id": video_id})
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+    fpath = video.get("file_path")
+    if not fpath or not os.path.exists(fpath):
+        raise HTTPException(status_code=410, detail="Source file missing on disk")
+    height = video.get("height") or 720
+    target = _target_height(height) or height
+    await db.videos.update_one(
+        {"video_id": video_id},
+        {"$set": {
+            "processing_status": "transcoding",
+            "transcode_target": f"{target}p",
+            "transcode_reason": "admin_normalize",
+        }},
+    )
+    schedule_transcode(video_id, video["user_id"], fpath, target)
+    logger.info(f"Admin {admin.get('email')} queued normalize for video {video_id} ({height}p→{target}p)")
+    return {"message": "Normalize queued", "video_id": video_id, "target_height": target}
+
+
+@api_router.post("/admin/videos/normalize-all")
+async def admin_normalize_all_non_conformant(admin: dict = Depends(get_admin_user)):
+    """Sweep every video and queue a normalize for any that isn't already
+    stream-copy-safe (h264+aac+GOP ≤ 2.5s). Serialized by the transcode
+    semaphore so CPU never spikes. Ideal to run the night before a big event."""
+    queued: list[str] = []
+    skipped: list[str] = []
+    async for v in db.videos.find({"processing_status": {"$ne": "transcoding"}}):
+        vid = v.get("video_id")
+        fpath = v.get("file_path")
+        if not vid or not fpath or not os.path.exists(fpath):
+            continue
+        try:
+            v_codec, a_codec = youtube_service._probe_codecs(fpath)
+            gop_s = (
+                youtube_service._probe_gop_seconds(fpath)
+                if (v_codec == "h264" and a_codec == "aac")
+                else 99.0
+            )
+            if v_codec == "h264" and a_codec == "aac" and gop_s <= 2.5:
+                skipped.append(vid)
+                continue
+        except Exception as e:
+            logger.warning(f"normalize-all: probe failed for {vid}: {e}")
+        height = v.get("height") or 720
+        target = _target_height(height) or height
+        await db.videos.update_one(
+            {"video_id": vid},
+            {"$set": {
+                "processing_status": "transcoding",
+                "transcode_target": f"{target}p",
+                "transcode_reason": "admin_bulk_normalize",
+            }},
+        )
+        schedule_transcode(vid, v["user_id"], fpath, target)
+        queued.append(vid)
+    logger.info(f"Admin {admin.get('email')} bulk-normalize: queued {len(queued)}, skipped {len(skipped)}")
+    return {"queued": len(queued), "already_ok": len(skipped), "video_ids": queued}
 
 
 @api_router.get("/admin/videos")

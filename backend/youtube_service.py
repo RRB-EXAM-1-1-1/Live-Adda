@@ -309,6 +309,11 @@ def start_ffmpeg_push(video_path: str, stream_key: str, loop: bool = True, bitra
             "-c:v", "libx264",
             "-preset", "ultrafast",
             "-tune", "zerolatency",
+            # Cap encoder to 1 thread — critical for concurrent streaming. With
+            # default (all cores), 10 parallel streams thrash the kernel
+            # scheduler; with -threads 1 each stream owns one core turn and
+            # total throughput per-vCPU stays linear even at 30+ streams.
+            "-threads", "1",
             "-profile:v", "high", "-level", "4.1",
             "-pix_fmt", "yuv420p",
             "-r", "30",
