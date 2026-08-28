@@ -243,7 +243,7 @@ def _probe_gop_seconds(video_path: str) -> float:
     return sum(diffs) / len(diffs) if diffs else 99.0
 
 
-def start_ffmpeg_push(video_path: str, stream_key: str, loop: bool = True) -> int:
+def start_ffmpeg_push(video_path: str, stream_key: str, loop: bool = True, bitrate_k: int = 1800) -> int:
     """Start an ffmpeg process pushing the given local video to YouTube RTMPS.
 
     Two modes, chosen automatically:
@@ -316,8 +316,8 @@ def start_ffmpeg_push(video_path: str, stream_key: str, loop: bool = True) -> in
             # blocks scene-cut keyframes from breaking the cadence.
             "-g", "60", "-keyint_min", "60", "-sc_threshold", "0",
             # True CBR — RTMP smoothness needs steady bytes/sec, not VBR bursts.
-            "-b:v", "1800k", "-minrate", "1800k", "-maxrate", "1800k",
-            "-bufsize", "3600k",
+            "-b:v", f"{bitrate_k}k", "-minrate", f"{bitrate_k}k", "-maxrate", f"{bitrate_k}k",
+            "-bufsize", f"{bitrate_k * 2}k",
             "-x264-params", "nal-hrd=cbr:force-cfr=1",
             "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
             # Resamples audio so loop-boundary jitter doesn't drift out of sync.

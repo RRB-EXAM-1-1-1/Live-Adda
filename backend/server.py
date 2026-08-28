@@ -2699,6 +2699,44 @@ async def startup_event():
                             f"watchdog: stream {sid} CPU-throttled — speed={latest_speed}x "
                             f"for {st['slow']} checks (bitrate too high or CPU saturated)"
                         )
+                        # Auto-restart at lower bitrate (1200k). Only fires ONCE
+                        # per stream — guarded by `auto_lowered_bitrate` — so we
+                        # never flap. Any subsequent throttle stays as a warning
+                        # so the operator can see the box is over-committed.
+                        if not s.get("auto_lowered_bitrate"):
+                            vid = s.get("video_id")
+                            key = s.get("stream_key")
+                            video = await db.videos.find_one({"video_id": vid}) if vid else None
+                            fpath = video.get("file_path") if video else None
+                            if fpath and key and os.path.exists(fpath):
+                                # Kill the current ffmpeg and respawn at 1200k.
+                                old_pid = s.get("ffmpeg_pid")
+                                try:
+                                    if old_pid:
+                                        youtube_service.stop_ffmpeg_push(old_pid)
+                                except Exception as e:
+                                    logger.warning(f"watchdog auto-restart: stop failed pid={old_pid}: {e}")
+                                try:
+                                    new_pid = youtube_service.start_ffmpeg_push(fpath, key, loop=True, bitrate_k=1200)
+                                    await db.live_streams.update_one(
+                                        {"_id": s["_id"]},
+                                        {"$set": {
+                                            "ffmpeg_pid": new_pid,
+                                            "auto_lowered_bitrate": True,
+                                            "bitrate_k": 1200,
+                                            "restarted_at": datetime.now(timezone.utc),
+                                            "restarted_reason": "watchdog_cpu_throttled",
+                                        }},
+                                    )
+                                    logger.info(
+                                        f"watchdog: auto-restarted stream {sid} at 1200k "
+                                        f"(new pid={new_pid}) after {st['slow']} slow checks"
+                                    )
+                                    # Reset counters so the freshly-restarted stream gets
+                                    # a fair evaluation window under the new bitrate.
+                                    st["slow"] = 0
+                                except Exception as e:
+                                    logger.error(f"watchdog auto-restart FAILED for stream {sid}: {e}")
                     elif drop_delta > 30:
                         health = "dropping_frames"
                         logger.warning(
