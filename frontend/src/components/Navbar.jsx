@@ -1,13 +1,27 @@
 import React from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { Link, useNavigate, useLocation } from 'react-router-dom';
 import { Button } from './ui/button';
 import { Radio } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext';
 
 export const Navbar = () => {
   const navigate = useNavigate();
+  const location = useLocation();
   const { isAuthenticated, user } = useAuth();
   const isLoggedIn = isAuthenticated;
+
+  // Smooth-scroll to a landing-page section. If we're already on "/" just
+  // scroll; otherwise route to "/#section" and let LandingPage's hash-effect
+  // handle the scroll after mount.
+  const scrollToSection = (sectionId) => (e) => {
+    e.preventDefault();
+    if (location.pathname === '/') {
+      const el = document.getElementById(sectionId);
+      if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    } else {
+      navigate(`/#${sectionId}`);
+    }
+  };
 
   return (
     <nav className="fixed top-0 left-0 right-0 z-50 bg-white/80 backdrop-blur-lg border-b border-gray-200">
@@ -21,12 +35,22 @@ export const Navbar = () => {
           </Link>
 
           <div className="flex items-center space-x-3 sm:space-x-6">
-            <Link to="/#features" className="hidden md:inline text-gray-600 hover:text-gray-900 transition-colors font-medium">
+            <a
+              href="/#features"
+              onClick={scrollToSection('features')}
+              data-testid="navbar-features-link"
+              className="hidden md:inline text-gray-600 hover:text-gray-900 transition-colors font-medium cursor-pointer"
+            >
               Features
-            </Link>
-            <Link to="/#pricing" className="hidden md:inline text-gray-600 hover:text-gray-900 transition-colors font-medium">
+            </a>
+            <a
+              href="/#pricing"
+              onClick={scrollToSection('pricing')}
+              data-testid="navbar-pricing-link"
+              className="hidden md:inline text-gray-600 hover:text-gray-900 transition-colors font-medium cursor-pointer"
+            >
               Pricing
-            </Link>
+            </a>
             
             {isLoggedIn ? (
               <div className="flex items-center space-x-3">
