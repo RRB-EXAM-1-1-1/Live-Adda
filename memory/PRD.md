@@ -316,3 +316,8 @@ For the 2 vCPU / 4 GB DigitalOcean droplet the user runs in production:
 - `/app/deploy/update.sh` now rewrites any Nginx upstream still pointing at `127.0.0.1:8000` to `127.0.0.1:8001` and runs `nginx -t && systemctl reload nginx` in step [4/5].
 - Fixes the Cloudflare 502 the user hit in production when their Nginx site config was stuck on the old backend port.
 - Runs after `git pull` + `yarn build`, so every subsequent `sudo ./deploy/update.sh` self-heals the port mismatch.
+
+## Google Ads Tag (gtag.js) (2026-06)
+- Added Google Ads conversion tag `AW-18464780307` as the first element inside `<head>` in `frontend/public/index.html`, per user's Google instructions.
+- Consolidated the existing GA4 tag (`G-2K0RCMSFZL`) into the same gtag.js snippet (one loader, two `gtag('config', …)` calls) so `dataLayer`/`gtag` aren't defined twice.
+- Requires `yarn build` + `sudo ./deploy/update.sh` on the Hetzner server to go live on liveadda.org.
