@@ -321,3 +321,9 @@ For the 2 vCPU / 4 GB DigitalOcean droplet the user runs in production:
 - Added Google Ads conversion tag `AW-18464780307` as the first element inside `<head>` in `frontend/public/index.html`, per user's Google instructions.
 - Consolidated the existing GA4 tag (`G-2K0RCMSFZL`) into the same gtag.js snippet (one loader, two `gtag('config', …)` calls) so `dataLayer`/`gtag` aren't defined twice.
 - Requires `yarn build` + `sudo ./deploy/update.sh` on the Hetzner server to go live on liveadda.org.
+
+## Forgot-Password OTP not delivered — RCA + Admin Password Reset (2026-06)
+- Root cause: OTP emails go through `email_service.py` which needs `EMERGENT_EMAIL_KEY`. The production Hetzner `backend/.env` was never given this key (setup.sh / .env.example / update.sh didn't mention it), so `send_email` raised "not configured", the error was swallowed, and the user still saw "code sent".
+- Fixes: `/api/auth/forgot-password` now returns 503 "Email delivery is temporarily unavailable… contact support on WhatsApp" when the key is missing (instead of lying). `update.sh` now warns if `EMERGENT_EMAIL_KEY` is missing. `.env.example` documents it.
+- New admin tool: `POST /api/admin/users/{user_id}/reset-password` (+ `GET /api/admin/email-health`). Admin Dashboard → Users tab → "Reset PW" button shows a one-time temp password (`LA-xxxxxxxx`) to hand to the user over WhatsApp.
+- Pending (user said "next week"): move OTP email to the user's own Resend account so the Emergent proxy/key is no longer needed.

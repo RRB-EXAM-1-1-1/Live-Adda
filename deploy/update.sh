@@ -59,7 +59,7 @@ supervisorctl update >/dev/null 2>&1 || true
 
 echo "    Checking required env vars in backend/.env ..."
 MISSING=0
-for VAR in RAZORPAY_KEY_ID RAZORPAY_KEY_SECRET PUBLIC_APP_URL; do
+for VAR in RAZORPAY_KEY_ID RAZORPAY_KEY_SECRET PUBLIC_APP_URL EMERGENT_EMAIL_KEY; do
   if ! grep -q "^${VAR}=" "$INSTALL_DIR/backend/.env" 2>/dev/null || \
      [ -z "$(grep "^${VAR}=" "$INSTALL_DIR/backend/.env" | cut -d'"' -f2)" ]; then
     echo "    !! WARNING: ${VAR} is missing/empty in backend/.env"

@@ -743,6 +743,13 @@ async def forgot_password(body: ForgotPasswordRequest):
     if channel not in ("email", "sms"):
         raise HTTPException(status_code=400, detail="channel must be 'email' or 'sms'")
 
+    if channel == "email" and not email_service.EMAIL_KEY:
+        logger.error("forgot-password: EMERGENT_EMAIL_KEY is not set — OTP emails cannot be delivered")
+        raise HTTPException(
+            status_code=503,
+            detail="Email delivery is temporarily unavailable. Please contact Live Adda support on WhatsApp and we will reset your password manually.",
+        )
+
     generic_ok = {"message": "If that account exists, a code has been sent.", "channel": channel}
     user = await db.users.find_one({"email": email})
     if not user:
@@ -3088,6 +3095,34 @@ async def admin_list_users(
             "plan_expires_at": u["plan_expires_at"].isoformat() if hasattr(u.get("plan_expires_at"), "isoformat") else None,
         })
     return {"count": len(rows), "users": rows}
+
+
+class AdminPasswordReset(BaseModel):
+    new_password: Optional[str] = None
+
+
+@api_router.post("/admin/users/{user_id}/reset-password")
+async def admin_reset_user_password(user_id: str, body: AdminPasswordReset, admin: dict = Depends(get_admin_user)):
+    """Admin sets a temporary password for a user who cannot receive the OTP email.
+    Returns the plaintext temp password ONCE so support can hand it to the user."""
+    target = await db.users.find_one({"user_id": user_id})
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    temp = (body.new_password or "").strip()
+    if temp and len(temp) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+    if not temp:
+        temp = "LA-" + secrets.token_urlsafe(6)
+    await db.users.update_one({"user_id": user_id}, {"$set": {"password_hash": hash_password(temp)}})
+    await db.password_reset_otps.delete_many({"email": target["email"]})
+    logger.info(f"admin {admin['email']} reset password for {target['email']}")
+    return {"email": target["email"], "temp_password": temp}
+
+
+@api_router.get("/admin/email-health")
+async def admin_email_health(admin: dict = Depends(get_admin_user)):
+    """Tells the admin whether OTP/transactional email can actually be sent."""
+    return {"email_configured": bool(email_service.EMAIL_KEY), "from_name": email_service.EMAIL_FROM_NAME}
 
 
 @api_router.get("/admin/users/{user_id}/history")

@@ -124,6 +124,17 @@ const AdminDashboard = () => {
     }
   };
 
+  const [tempPw, setTempPw] = useState(null); // { email, temp_password }
+  const resetUserPassword = async (u) => {
+    if (!window.confirm(`Set a new temporary password for ${u.email}? Their old password will stop working.`)) return;
+    try {
+      const { data } = await api.post(`/admin/users/${u.user_id}/reset-password`, {});
+      setTempPw(data);
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || 'Failed to reset password');
+    }
+  };
+
   const sendReply = async (ticketId, closeAfter) => {
     try {
       const body = {};
@@ -453,7 +464,7 @@ const AdminDashboard = () => {
                   <th className="px-4 py-3">Plan</th>
                   <th className="px-4 py-3">Slots</th>
                   <th className="px-4 py-3">Joined</th>
-                  <th className="px-4 py-3 text-right">History</th>
+                  <th className="px-4 py-3 text-right">Actions</th>
                 </tr>
               </thead>
               <tbody>
@@ -465,9 +476,12 @@ const AdminDashboard = () => {
                     <td className="px-4 py-3 text-gray-300">{u.plan || '—'}</td>
                     <td className="px-4 py-3 text-gray-300">{u.stream_slots}</td>
                     <td className="px-4 py-3 text-gray-500 text-xs">{fmtDateOnly(u.created_at)}</td>
-                    <td className="px-4 py-3 text-right">
+                    <td className="px-4 py-3 text-right whitespace-nowrap">
                       <Button size="sm" variant="secondary" onClick={() => openHistory(u.user_id)}
                         data-testid={`admin-history-${u.user_id}`}>View</Button>
+                      <Button size="sm" variant="outline" className="ml-2 border-amber-500/50 text-amber-300 hover:bg-amber-500/10"
+                        onClick={() => resetUserPassword(u)}
+                        data-testid={`admin-reset-pw-${u.user_id}`}>Reset PW</Button>
                     </td>
                   </tr>
                 ))}
@@ -616,6 +630,28 @@ const AdminDashboard = () => {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {/* Temporary password dialog */}
+      <Dialog open={!!tempPw} onOpenChange={() => setTempPw(null)}>
+        <DialogContent className="max-w-md bg-gray-900 border-gray-700 text-white" data-testid="temp-password-dialog">
+          <DialogHeader>
+            <DialogTitle>Temporary password set</DialogTitle>
+            <DialogDescription className="text-gray-400">
+              Share this with <span className="text-white">{tempPw?.email}</span> via WhatsApp. It is shown only once.
+              Ask them to change it from Profile after logging in.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex items-center gap-2 bg-gray-950 border border-gray-700 rounded-lg px-4 py-3">
+            <code className="flex-1 text-lg tracking-wider text-emerald-300" data-testid="temp-password-value">{tempPw?.temp_password}</code>
+            <Button size="sm" variant="secondary" data-testid="temp-password-copy"
+              onClick={() => { navigator.clipboard?.writeText(tempPw?.temp_password || ''); toast.success('Copied'); }}>Copy</Button>
+          </div>
+          <DialogFooter>
+            <Button onClick={() => setTempPw(null)} data-testid="temp-password-close">Done</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
 
       {/* Card drill-down dialog (Paying Users, Sign-ups, All Videos) */}
       <Dialog open={!!detail} onOpenChange={() => setDetail(null)}>
