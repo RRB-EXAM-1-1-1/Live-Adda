@@ -262,7 +262,7 @@ const VideoManager = () => {
               {/* Thumbnail */}
               <div className="relative aspect-video bg-gradient-to-br from-gray-900 to-gray-800 flex items-center justify-center overflow-hidden">
                 <VideoThumbnail videoId={video.video_id} title={video.title} />
-                {/* Duration + Resolution chips */}
+                {/* Duration chip */}
                 <div className="absolute bottom-2 right-2 flex gap-1.5">
                   {video.duration && video.duration !== '00:00' && (
                     <span
@@ -272,26 +272,15 @@ const VideoManager = () => {
                       {video.duration}
                     </span>
                   )}
-                  {video.height ? (
-                    <span
-                      className="px-2 py-0.5 bg-blue-500/85 text-white text-[11px] font-semibold rounded"
-                      data-testid={`video-resolution-${video.video_id}`}
-                    >
-                      {video.height}p
-                    </span>
-                  ) : null}
                 </div>
-                {/* Transcoding overlay */}
+                {/* Processing overlay */}
                 {video.processing_status === 'transcoding' && (
                   <div
                     className="absolute inset-0 bg-black/70 flex flex-col items-center justify-center gap-2"
                     data-testid={`video-transcoding-${video.video_id}`}
                   >
                     <div className="w-8 h-8 border-2 border-blue-400 border-t-transparent rounded-full animate-spin" />
-                    <p className="text-white text-xs font-semibold">Processing…</p>
-                    {video.transcode_target && (
-                      <p className="text-blue-300 text-[10px] font-medium">→ {video.transcode_target}</p>
-                    )}
+                    <p className="text-white text-xs font-semibold">Preparing for stream…</p>
                   </div>
                 )}
               </div>
@@ -300,7 +289,7 @@ const VideoManager = () => {
               <div className="p-4">
                 <h3 className="text-white font-semibold mb-2 truncate" data-testid={`video-title-${video.video_id}`}>{video.title}</h3>
                 <div className="flex items-center justify-between text-sm text-gray-400 mb-4">
-                  <span>{formatBytes(video.size)}</span>
+                  <span>{formatBytes(video.original_size || video.size)}</span>
                   <span className="flex items-center">
                     <Clock className="w-3 h-3 mr-1" />
                     {new Date(video.uploaded_at).toLocaleDateString()}
