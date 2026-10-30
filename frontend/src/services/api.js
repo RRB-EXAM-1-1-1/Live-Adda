@@ -279,6 +279,15 @@ export const supportAPI = {
 
 // Razorpay APIs
 export const razorpayAPI = {
+  syncPayments: async () => {
+    try {
+      const { data } = await api.post('/razorpay/sync');
+      return { data, error: null };
+    } catch (error) {
+      return { data: null, error: formatApiError(error) };
+    }
+  },
+
   createOrder: async (planId) => {
     try {
       const { data } = await api.post('/razorpay/create-order', { plan_id: planId });

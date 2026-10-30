@@ -1789,6 +1789,60 @@ async def razorpay_create_order(request: Request, user: dict = Depends(get_curre
         "prefill": {"name": user.get("name", ""), "email": user.get("email", "")}
     }
 
+async def _finalize_paid_order(order_id: str, payment_id: Optional[str], source: str) -> bool:
+    """Idempotently mark a Razorpay order as paid and activate the plan.
+    Shared by verify-payment, the webhook and the reconciliation loop."""
+    txn = await db.payment_transactions.find_one({"order_id": order_id}, {"_id": 0})
+    if not txn:
+        return False
+    res = await db.payment_transactions.update_one(
+        {"order_id": order_id, "status": {"$ne": "completed"}},
+        {"$set": {"payment_status": "paid", "status": "completed", "payment_id": payment_id,
+                  "completed_at": datetime.now(timezone.utc), "completed_via": source}}
+    )
+    if res.modified_count == 0:
+        return False
+    await activate_or_extend_plan(txn["user_id"], txn["plan_id"])
+    logger.info(f"Razorpay plan '{txn['plan_id']}' activated for user {txn['user_id']} via {source} (order={order_id})")
+    return True
+
+
+async def _reconcile_pending_order(txn: dict) -> bool:
+    """Ask Razorpay whether a pending order was actually paid. Returns True if activated."""
+    order_id = txn["order_id"]
+    try:
+        payments = await asyncio.to_thread(razorpay_client.order.payments, order_id)
+    except Exception as e:
+        logger.warning(f"reconcile: order.payments failed for {order_id}: {e}")
+        return False
+    captured = next((p for p in payments.get("items", []) if p.get("status") == "captured"), None)
+    if not captured:
+        try:
+            order = await asyncio.to_thread(razorpay_client.order.fetch, order_id)
+        except Exception:
+            return False
+        if order.get("status") != "paid":
+            return False
+    return await _finalize_paid_order(order_id, captured["id"] if captured else None, "reconcile")
+
+
+@api_router.post("/razorpay/sync")
+async def razorpay_sync_my_payments(user: dict = Depends(get_current_user)):
+    """User-triggered safety net: re-check every pending order from the last 3 days."""
+    if not razorpay_client:
+        return {"activated": 0}
+    since = datetime.now(timezone.utc) - timedelta(days=3)
+    pending = await db.payment_transactions.find(
+        {"user_id": user["user_id"], "gateway": "razorpay", "status": {"$ne": "completed"},
+         "created_at": {"$gte": since}}, {"_id": 0}
+    ).to_list(20)
+    activated = 0
+    for txn in pending:
+        if await _reconcile_pending_order(txn):
+            activated += 1
+    return {"activated": activated, "checked": len(pending)}
+
+
 @api_router.post("/razorpay/verify-payment")
 async def razorpay_verify_payment(request: Request, user: dict = Depends(get_current_user)):
     """Verify the Razorpay payment signature and activate the plan on success."""
@@ -1824,23 +1878,8 @@ async def razorpay_verify_payment(request: Request, user: dict = Depends(get_cur
     if not transaction:
         raise HTTPException(status_code=404, detail="Order not found")
 
-    # Idempotent activation
-    result = await db.payment_transactions.update_one(
-        {"order_id": order_id, "status": {"$ne": "completed"}},
-        {"$set": {
-            "payment_status": "paid",
-            "status": "completed",
-            "payment_id": payment_id,
-            "completed_at": datetime.now(timezone.utc)
-        }}
-    )
-
-    if result.modified_count > 0:
-        plan_id = transaction["plan_id"]
-        # Slot-stacking activation — appends a new entry per different plan,
-        # extends duration if the same plan is bought again.
-        await activate_or_extend_plan(user["user_id"], plan_id)
-        logger.info(f"Razorpay plan '{plan_id}' activated (slot-stacking) for user {user['user_id']}")
+    # Idempotent activation (shared path with webhook + reconciliation)
+    await _finalize_paid_order(order_id, payment_id, "client_verify")
 
     return {"status": "success", "message": "Payment verified and plan activated"}
 
@@ -1869,16 +1908,7 @@ async def razorpay_webhook(request: Request):
         order_id = entity.get("order_id")
         payment_id = entity.get("id")
         if order_id:
-            txn = await db.payment_transactions.find_one({"order_id": order_id}, {"_id": 0})
-            if txn:
-                res = await db.payment_transactions.update_one(
-                    {"order_id": order_id, "status": {"$ne": "completed"}},
-                    {"$set": {"payment_status": "paid", "status": "completed",
-                              "payment_id": payment_id, "completed_at": datetime.now(timezone.utc)}}
-                )
-                if res.modified_count > 0:
-                    # Slot-stacking activation (same code path as verify_payment)
-                    await activate_or_extend_plan(txn["user_id"], txn["plan_id"])
+            await _finalize_paid_order(order_id, payment_id, "webhook")
     return {"status": "processed"}
 
 # ==================== BILLING ENDPOINTS ====================
@@ -2633,9 +2663,51 @@ async def startup_event():
                             logger.warning(f"sweeper: wipe_all_videos_for_user failed user={user_id}: {e}")
             except Exception as e:
                 logger.warning(f"plan expiry sweep loop error: {e}")
+
+            # Disk hygiene: users with NO live stream but whose every plan has
+            # expired must also lose their videos (the block above only sees
+            # users that are currently live).
+            try:
+                owner_ids = await db.videos.distinct("user_id")
+                for uid in owner_ids:
+                    u = await db.users.find_one({"user_id": uid})
+                    if not u or u.get("plan") == "lifetime" or _active_entries(u):
+                        continue
+                    await db.users.update_one(
+                        {"user_id": uid},
+                        {"$set": {"active_plans": [], "plan": None, "plan_expires_at": None, "stream_slots": 0}},
+                    )
+                    wiped = await wipe_all_videos_for_user(uid)
+                    if wiped:
+                        logger.info(f"sweeper: wiped {wiped} idle videos for expired user {uid}")
+            except Exception as e:
+                logger.warning(f"expired-video sweep error: {e}")
             await asyncio.sleep(30)
 
     asyncio.create_task(_plan_expiry_sweep_loop())
+
+    # ---------- Razorpay reconciliation ----------------------------------------
+    # If the browser never called /verify-payment (UPI app switch, tab closed,
+    # network drop) and no webhook arrived, the order stays "pending" forever
+    # even though Razorpay captured the money. Every 60s ask Razorpay directly.
+    async def _payment_reconcile_loop():
+        while True:
+            try:
+                if razorpay_client:
+                    now = datetime.now(timezone.utc)
+                    pending = await db.payment_transactions.find({
+                        "gateway": "razorpay",
+                        "status": {"$ne": "completed"},
+                        "created_at": {"$gte": now - timedelta(days=3), "$lte": now - timedelta(seconds=90)},
+                    }, {"_id": 0}).to_list(200)
+                    for txn in pending:
+                        if await _reconcile_pending_order(txn):
+                            logger.info(f"reconcile: recovered pending order {txn['order_id']}")
+            except Exception as e:
+                logger.warning(f"payment reconcile loop error: {e}")
+            await asyncio.sleep(60)
+
+    asyncio.create_task(_payment_reconcile_loop())
 
     # ---------- Ingest health watchdog -----------------------------------------
     # Parses each live stream's ffmpeg log every 30 s. If ffmpeg is falling
@@ -2789,17 +2861,20 @@ async def startup_event():
     asyncio.create_task(_ingest_watchdog_loop())
 
     # ---------- Plan-expiry reminder broadcast (WhatsApp alternative) ----------
-    # Fires an in-app broadcast to any user whose (soonest) active plan expires
-    # in 20-28h. Uses the existing `notifications` collection so the banner
-    # `NotificationBanner.jsx` already renders in the dashboard picks it up.
-    # We dedupe per-user-per-plan-expiry so a user never sees the same nudge twice.
+    # Reminders fire at THREE stages before the soonest plan expiry, each
+    # targeted to that user only: ~24h, ~6h and ~1h. Loop runs every 15 min;
+    # each window is wider than the loop interval so nobody is skipped, and the
+    # (user, expiry, stage) dedupe key guarantees exactly one banner per stage.
+    REMINDER_STAGES = [  # (stage, window_start_h, window_end_h)
+        ("24h", 22, 28),
+        ("6h", 4.5, 7.5),
+        ("1h", 0.5, 1.75),
+    ]
+
     async def _plan_expiry_reminder_loop():
         while True:
             try:
                 now = datetime.now(timezone.utc)
-                window_start = now + timedelta(hours=20)
-                window_end = now + timedelta(hours=28)
-                # Users on lifetime never expire; only look at users with active_plans
                 cursor = db.users.find({
                     "plan": {"$ne": "lifetime"},
                     "active_plans": {"$exists": True, "$ne": []},
@@ -2810,21 +2885,24 @@ async def startup_event():
                         continue
                     soonest = min(live_entries, key=lambda e: e["expires_at"])
                     exp = soonest["expires_at"]
-                    if not (window_start <= exp <= window_end):
+                    hours_left = (exp - now).total_seconds() / 3600
+                    stage = next((s for s, lo, hi in REMINDER_STAGES if lo <= hours_left <= hi), None)
+                    if not stage:
                         continue
-                    # Dedupe: skip if we already stored a reminder for this user+exp
                     exp_key = exp.isoformat()
                     dup = await db.notifications.find_one({
                         "kind": "plan_reminder",
                         "user_id": u["user_id"],
                         "plan_expires_at": exp_key,
+                        "stage": stage,
                     })
                     if dup:
                         continue
-                    remaining_hours = int((exp - now).total_seconds() // 3600)
+                    remaining_hours = max(1, int(round(hours_left)))
                     doc = {
                         "notification_id": f"note_{uuid.uuid4().hex[:12]}",
                         "kind": "plan_reminder",
+                        "stage": stage,
                         "user_id": u["user_id"],   # user-targeted, not broadcast
                         "plan_expires_at": exp_key,
                         "title": f"Your plan expires in ~{remaining_hours}h",
@@ -2840,12 +2918,10 @@ async def startup_event():
                         "active": True,
                     }
                     await db.notifications.insert_one(doc)
-                    logger.info(f"plan-reminder: queued for user={u['user_id']} expires_in={remaining_hours}h")
+                    logger.info(f"plan-reminder[{stage}]: queued for user={u['user_id']} expires_in={remaining_hours}h")
             except Exception as e:
                 logger.warning(f"plan expiry reminder loop error: {e}")
-            # Runs every hour — window is 8h wide so we can't miss anyone,
-            # dedupe key guarantees at most one nudge per user per plan-expiry.
-            await asyncio.sleep(3600)
+            await asyncio.sleep(900)
 
     asyncio.create_task(_plan_expiry_reminder_loop())
 
@@ -3420,7 +3496,10 @@ async def user_notifications(user: dict = Depends(get_current_user)):
     - all: everyone
     - active_plan: users with any non-expired plan or lifetime
     - live_only: users with at least one is_live=True stream right now"""
-    notes = await db.notifications.find({"active": True}, {"_id": 0}).sort("created_at", -1).to_list(50)
+    notes = await db.notifications.find(
+        {"active": True, "$or": [{"audience": {"$ne": "user"}}, {"user_id": user["user_id"]}]},
+        {"_id": 0},
+    ).sort("created_at", -1).to_list(50)
     if not notes:
         return {"notifications": []}
     active = _active_entries(user)
@@ -3429,8 +3508,13 @@ async def user_notifications(user: dict = Depends(get_current_user)):
     out = []
     for n in notes:
         aud = n.get("audience", "all")
+        if aud == "user" and n.get("user_id") != user["user_id"]: continue
         if aud == "active_plan" and not has_plan: continue
         if aud == "live_only" and not is_live: continue
+        # A reminder for a plan that has since been renewed/expired is stale
+        if n.get("kind") == "plan_reminder":
+            active_keys = {e["expires_at"].isoformat() for e in active}
+            if n.get("plan_expires_at") not in active_keys: continue
         if hasattr(n.get("created_at"), "isoformat"):
             n["created_at"] = n["created_at"].isoformat()
         out.append(n)

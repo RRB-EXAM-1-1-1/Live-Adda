@@ -48,6 +48,7 @@ const Billings = () => {
 
   useEffect(() => {
     loadBillingData();
+    syncPendingPayments(false);
   }, []);
 
   const loadBillingData = async () => {
@@ -56,6 +57,20 @@ const Billings = () => {
 
     const txnResult = await billingAPI.getTransactions();
     if (txnResult.data) setTransactions(txnResult.data);
+  };
+
+  const [syncing, setSyncing] = useState(false);
+  const syncPendingPayments = async (manual) => {
+    setSyncing(true);
+    const { data } = await razorpayAPI.syncPayments();
+    setSyncing(false);
+    if (data?.activated > 0) {
+      toast.success('🎉 Payment confirmed! Your plan is now active.');
+      await refreshUser();
+      await loadBillingData();
+    } else if (manual) {
+      toast.info(data?.checked ? 'Payment not confirmed by Razorpay yet. If money was deducted, it usually confirms within a few minutes.' : 'No pending payments.');
+    }
   };
 
   const handlePurchase = async (planId) => {
@@ -101,7 +116,10 @@ const Billings = () => {
       modal: {
         ondismiss: () => {
           setProcessingPlan(null);
-          toast.info('Payment cancelled');
+          toast.info('Payment window closed. Checking payment status…');
+          // UPI-app / tab-switch flows often complete the payment but never
+          // return to the handler — ask the server to confirm with Razorpay.
+          setTimeout(() => { syncPendingPayments(false); loadBillingData(); }, 4000);
         }
       }
     };
@@ -282,9 +300,14 @@ const Billings = () => {
 
       {/* Transaction History */}
       <div className="bg-gray-800/50 backdrop-blur-lg rounded-2xl p-6 border border-gray-700">
-        <h2 className="text-xl font-bold text-white mb-6 flex items-center">
-          <Clock className="w-5 h-5 mr-2 text-blue-500" />
-          Transaction History
+        <h2 className="text-xl font-bold text-white mb-6 flex items-center justify-between">
+          <span className="flex items-center"><Clock className="w-5 h-5 mr-2 text-blue-500" />Transaction History</span>
+          {transactions.some((t) => t.payment_status !== 'paid') && (
+            <Button size="sm" variant="outline" disabled={syncing} onClick={() => syncPendingPayments(true)}
+              className="border-amber-500/50 text-amber-300 hover:bg-amber-500/10" data-testid="check-payment-status-btn">
+              {syncing ? 'Checking…' : 'Check pending payment'}
+            </Button>
+          )}
         </h2>
 
         {transactions.length > 0 ? (
