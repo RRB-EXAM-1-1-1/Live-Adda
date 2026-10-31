@@ -288,9 +288,9 @@ export const razorpayAPI = {
     }
   },
 
-  createOrder: async (planId) => {
+  createOrder: async (planId, renewSlotId = null) => {
     try {
-      const { data } = await api.post('/razorpay/create-order', { plan_id: planId });
+      const { data } = await api.post('/razorpay/create-order', { plan_id: planId, renew_slot_id: renewSlotId });
       return { data, error: null };
     } catch (error) {
       return { data: null, error: formatApiError(error) };
@@ -366,12 +366,13 @@ export const youtubeAPI = {
     }
   },
 
-  startWithKey: async (videoId, streamKey, loop = true) => {
+  startWithKey: async (videoId, streamKey, loop = true, slotId = null) => {
     try {
       const { data } = await api.post('/stream/start-with-key', {
         video_id: videoId,
         stream_key: streamKey,
-        loop
+        loop,
+        slot_id: slotId
       });
       return { data, error: null };
     } catch (error) {
@@ -400,3 +401,22 @@ export const youtubeAPI = {
 };
 
 export default api;
+
+export const slotsAPI = {
+  list: async () => {
+    try {
+      const { data } = await api.get('/slots');
+      return { data, error: null };
+    } catch (error) {
+      return { data: null, error: formatApiError(error) };
+    }
+  },
+  rename: async (slotId, name) => {
+    try {
+      const { data } = await api.put(`/slots/${slotId}`, { name });
+      return { data, error: null };
+    } catch (error) {
+      return { data: null, error: formatApiError(error) };
+    }
+  }
+};

@@ -200,7 +200,7 @@ const Dashboard = () => {
           {stats?.active_live_slots > 0 ? (
             <p className="text-gray-300">Your stream is currently live!</p>
           ) : (
-            <p className="text-gray-400">No active stream. Start streaming from the Live Slot page.</p>
+            <p className="text-gray-400">No active stream. Go live from the My Slots page.</p>
           )}
         </div>
 

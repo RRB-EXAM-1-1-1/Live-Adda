@@ -280,6 +280,11 @@ class StreamKeyStart(BaseModel):
     video_id: str
     stream_key: str
     loop: bool = True
+    slot_id: Optional[str] = None
+
+
+class SlotRename(BaseModel):
+    name: str
 
 class SupportTicket(BaseModel):
     subject: str
@@ -387,6 +392,8 @@ def _active_entries(user: dict) -> List[dict]:
         exp = _as_utc(e.get("expires_at"))
         if exp and exp > now:
             live.append({
+                "slot_id": e.get("slot_id"),
+                "name": e.get("name"),
                 "plan_id": e.get("plan_id"),
                 "purchased_at": _as_utc(e.get("purchased_at")) or now,
                 "expires_at": exp,
@@ -402,6 +409,63 @@ def compute_stream_slots(user: dict) -> int:
     return len(live)
 
 
+SLOT_RETENTION_DAYS = 30  # expired slots stay visible (renewable) this long
+
+
+def _retained_entries(user: dict) -> List[dict]:
+    """All slot entries (live + expired < 30 days), each guaranteed to carry a
+    slot_id and a name. Legacy entries get stable ids on the fly."""
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=SLOT_RETENTION_DAYS)
+    entries = list(user.get("active_plans") or [])
+    if not entries and user.get("plan") and user.get("plan") != "lifetime" and user.get("plan_expires_at"):
+        legacy_exp = _as_utc(user.get("plan_expires_at"))
+        if legacy_exp:
+            entries = [{"plan_id": user["plan"], "purchased_at": _as_utc(user.get("plan_started_at")) or now, "expires_at": legacy_exp}]
+    out = []
+    for i, e in enumerate(entries):
+        exp = _as_utc(e.get("expires_at"))
+        if not exp or exp <= cutoff:
+            continue
+        legacy_key = f"{user.get('user_id')}:{i}:{exp.isoformat()}"
+        out.append({
+            "slot_id": e.get("slot_id") or "slot_" + hashlib.md5(legacy_key.encode()).hexdigest()[:10],
+            "name": e.get("name") or f"Slot {i + 1}",
+            "plan_id": e.get("plan_id"),
+            "purchased_at": _as_utc(e.get("purchased_at")) or now,
+            "expires_at": exp,
+        })
+    return out
+
+
+def _lifetime_slots(user: dict) -> List[dict]:
+    names = user.get("slot_names") or {}
+    far = datetime.now(timezone.utc) + timedelta(days=36500)
+    return [{"slot_id": f"lifetime_{i}", "name": names.get(f"lifetime_{i}") or f"Slot {i}",
+             "plan_id": "lifetime", "purchased_at": None, "expires_at": far}
+            for i in range(1, compute_stream_slots(user) + 1)]
+
+
+def _all_slots(user: dict) -> List[dict]:
+    return _lifetime_slots(user) if user.get("plan") == "lifetime" else _retained_entries(user)
+
+
+async def _stop_streams_for_dead_slots(user_id: str, live_slot_ids: set) -> None:
+    """Stop any live stream bound to a slot that is no longer active."""
+    async for s in db.live_streams.find({"user_id": user_id, "is_live": True, "slot_id": {"$exists": True, "$nin": list(live_slot_ids)}}):
+        if s.get("ffmpeg_pid"):
+            try:
+                youtube_service.stop_ffmpeg_push(s["ffmpeg_pid"])
+            except Exception as e:
+                logger.warning(f"Failed to stop ffmpeg pid={s['ffmpeg_pid']}: {e}")
+        await db.live_streams.update_one(
+            {"_id": s["_id"]},
+            {"$set": {"is_live": False, "ffmpeg_pid": None, "stopped_at": datetime.now(timezone.utc), "stopped_reason": "slot_expired"}},
+        )
+        logger.info(f"Stopped stream {s.get('stream_id')} — slot {s.get('slot_id')} expired (user {user_id})")
+        await cleanup_stream_video_if_orphaned(user_id, s.get("video_id"))
+
+
 async def sync_user_plans_and_enforce_slots(user: dict) -> dict:
     """Prune expired entries, refresh legacy display fields, and if the user's
     concurrent-stream count now EXCEEDS their slots, stop the excess ffmpeg
@@ -411,6 +475,7 @@ async def sync_user_plans_and_enforce_slots(user: dict) -> dict:
         return user
 
     live = _active_entries(user)
+    retained = _retained_entries(user)
 
     # Update stored active_plans + legacy display fields
     if live:
@@ -425,12 +490,15 @@ async def sync_user_plans_and_enforce_slots(user: dict) -> dict:
     await db.users.update_one(
         {"user_id": user["user_id"]},
         {"$set": {
-            "active_plans": live,
+            "active_plans": retained,
             "plan": legacy_plan,
             "plan_expires_at": legacy_expiry,
-            "stream_slots": (3 if user.get("plan") == "lifetime" else len(live)),
+            "stream_slots": len(live),
         }}
     )
+
+    # Streams bound to a slot that has expired must stop first
+    await _stop_streams_for_dead_slots(user["user_id"], {e["slot_id"] for e in retained if e["expires_at"] > datetime.now(timezone.utc)})
 
     # Enforce slot budget: if streams > slots, stop the newest excess streams
     max_slots = len(live)
@@ -544,45 +612,47 @@ async def wipe_all_videos_for_user(user_id: str) -> int:
     return count
 
 
-async def activate_or_extend_plan(user_id: str, plan_id: str) -> dict:
-    """Idempotently apply a plan purchase to a user's active_plans.
-    - If the user already has a non-expired entry for the same plan_id:
-      EXTEND that entry's expires_at by plan.duration_days (stack).
-    - Otherwise: APPEND a new entry (adds a stream slot).
-    Also updates legacy plan / plan_expires_at fields to the latest-expiring plan.
-    Returns the fresh user doc."""
+async def activate_or_extend_plan(user_id: str, plan_id: str, renew_slot_id: Optional[str] = None) -> dict:
+    """Apply a plan purchase to a user's slots.
+    - renew_slot_id given and found: extend that slot (active → +duration from
+      its current expiry; expired → +duration from now). Name/assignment kept.
+    - otherwise: APPEND a brand-new slot (unlimited purchases per tier).
+    Also refreshes legacy plan / plan_expires_at display fields."""
     plan = PLANS[plan_id]
     now = datetime.now(timezone.utc)
+    duration = timedelta(days=plan["duration_days"])
 
     user = await db.users.find_one({"user_id": user_id})
-    live = _active_entries(user or {})
+    entries = _retained_entries(user or {})
 
-    # Find existing entry for the same plan_id (stack duration)
-    existing = next((e for e in live if e["plan_id"] == plan_id), None)
-    if existing:
-        existing["expires_at"] = existing["expires_at"] + timedelta(days=plan["duration_days"])
+    target = next((e for e in entries if renew_slot_id and e["slot_id"] == renew_slot_id), None)
+    if target:
+        base = target["expires_at"] if target["expires_at"] > now else now
+        target["expires_at"] = base + duration
+        target["plan_id"] = plan_id
     else:
-        live.append({
+        entries.append({
+            "slot_id": f"slot_{uuid.uuid4().hex[:10]}",
+            "name": f"Slot {len(entries) + 1}",
             "plan_id": plan_id,
             "purchased_at": now,
-            "expires_at": now + timedelta(days=plan["duration_days"]),
+            "expires_at": now + duration,
         })
 
-    # Sort by expires_at descending; the latest-expiring is the "display primary"
-    live.sort(key=lambda e: e["expires_at"], reverse=True)
-    primary = live[0]
+    live = [e for e in entries if e["expires_at"] > now]
+    primary = max(live, key=lambda e: e["expires_at"])
 
     await db.users.update_one(
         {"user_id": user_id},
         {"$set": {
-            "active_plans": live,
+            "active_plans": entries,
             "plan": primary["plan_id"],
             "plan_expires_at": primary["expires_at"],
             "stream_slots": len(live),
         }}
     )
     logger.info(
-        f"Plan '{plan_id}' activated for user {user_id} — total active plans = {len(live)} (slots)."
+        f"Plan '{plan_id}' {'renewed slot ' + renew_slot_id if target else 'added new slot'} for user {user_id} — active slots = {len(live)}."
     )
     return await db.users.find_one({"user_id": user_id}, {"_id": 0, "password_hash": 0})
 
@@ -596,7 +666,7 @@ async def check_active_plan(user: dict):
         # Also clear stale legacy fields
         await db.users.update_one(
             {"user_id": user["user_id"]},
-            {"$set": {"active_plans": [], "plan": None, "plan_expires_at": None, "stream_slots": 0}}
+            {"$set": {"active_plans": _retained_entries(user), "plan": None, "plan_expires_at": None, "stream_slots": 0}}
         )
         # Auto-cleanup: stop any lingering ffmpeg process, delete their videos.
         # Runs at most once per user (subsequent calls find no videos to wipe).
@@ -1748,8 +1818,11 @@ async def razorpay_create_order(request: Request, user: dict = Depends(get_curre
 
     body = await request.json()
     plan_id = body.get("plan_id")
-    if plan_id not in PLANS:
+    if plan_id not in PLANS or plan_id == "lifetime":
         raise HTTPException(status_code=400, detail="Invalid plan")
+    renew_slot_id = (body.get("renew_slot_id") or "").strip() or None
+    if renew_slot_id and not any(e["slot_id"] == renew_slot_id for e in _retained_entries(user)):
+        raise HTTPException(status_code=404, detail="That slot no longer exists — please buy a new slot instead.")
 
     plan = PLANS[plan_id]
     amount_paise = int(plan["inr"]) * 100  # rupees -> paise
@@ -1760,7 +1833,7 @@ async def razorpay_create_order(request: Request, user: dict = Depends(get_curre
             "currency": "INR",
             "payment_capture": 1,
             "receipt": f"rcpt_{uuid.uuid4().hex[:16]}",  # must be <= 40 chars
-            "notes": {"user_id": user["user_id"], "plan_id": plan_id}
+            "notes": {"user_id": user["user_id"], "plan_id": plan_id, "renew_slot_id": renew_slot_id or ""}
         })
     except Exception as e:
         logger.error(f"Razorpay order creation failed: {e}")
@@ -1773,6 +1846,7 @@ async def razorpay_create_order(request: Request, user: dict = Depends(get_curre
         "gateway": "razorpay",
         "order_id": order["id"],
         "plan_id": plan_id,
+        "renew_slot_id": renew_slot_id,
         "amount": plan["inr"],
         "currency": "INR",
         "payment_status": "pending",
@@ -1802,7 +1876,7 @@ async def _finalize_paid_order(order_id: str, payment_id: Optional[str], source:
     )
     if res.modified_count == 0:
         return False
-    await activate_or_extend_plan(txn["user_id"], txn["plan_id"])
+    await activate_or_extend_plan(txn["user_id"], txn["plan_id"], txn.get("renew_slot_id"))
     logger.info(f"Razorpay plan '{txn['plan_id']}' activated for user {txn['user_id']} via {source} (order={order_id})")
     return True
 
@@ -2143,6 +2217,87 @@ async def youtube_stop_broadcast(user: dict = Depends(get_current_user)):
     )
     return {"message": "Broadcast stopped"}
 
+# ==================== MY SLOTS ====================
+
+@api_router.get("/slots")
+async def list_my_slots(user: dict = Depends(get_current_user)):
+    """Every slot the user owns (active + expired < 30 days) with its live stream, if any."""
+    if user.get("plan") != "lifetime":
+        user = await sync_user_plans_and_enforce_slots(user)
+    now = datetime.now(timezone.utc)
+    slots = _all_slots(user)
+    streams = await db.live_streams.find(
+        {"user_id": user["user_id"], "is_live": True}, {"_id": 0, "ffmpeg_pid": 0, "stream_key": 0}
+    ).sort("started_at", 1).to_list(100)
+    by_slot = {s["slot_id"]: s for s in streams if s.get("slot_id")}
+    unbound = [s for s in streams if not s.get("slot_id")]
+
+    out = []
+    for idx, e in enumerate(slots, start=1):
+        s = by_slot.get(e["slot_id"])
+        if not s and unbound and e["expires_at"] > now:
+            s = unbound.pop(0)  # legacy stream started before slot binding existed
+        hours_left = (e["expires_at"] - now).total_seconds() / 3600
+        if e["plan_id"] == "lifetime":
+            status = "live" if s else "ready"
+        elif hours_left <= 0:
+            status = "expired"
+        elif s:
+            status = "live"
+        else:
+            status = "ready"
+        out.append({
+            "slot_id": e["slot_id"],
+            "number": idx,
+            "name": e["name"],
+            "plan_id": e["plan_id"],
+            "plan_name": PLANS.get(e["plan_id"], {}).get("name", e["plan_id"]),
+            "plan_inr": PLANS.get(e["plan_id"], {}).get("inr", 0),
+            "purchased_at": e["purchased_at"].isoformat() if e["purchased_at"] else None,
+            "expires_at": None if e["plan_id"] == "lifetime" else e["expires_at"].isoformat(),
+            "hours_left": None if e["plan_id"] == "lifetime" else max(0, round(hours_left, 1)),
+            "expiring_soon": e["plan_id"] != "lifetime" and 0 < hours_left <= 24,
+            "status": status,
+            "stream": None if not s else {
+                "stream_id": s.get("stream_id"),
+                "video_id": s.get("video_id"),
+                "video_title": s.get("current_video"),
+                "started_at": s["started_at"].isoformat() if hasattr(s.get("started_at"), "isoformat") else s.get("started_at"),
+            },
+        })
+    order = {"live": 0, "ready": 1, "expired": 2}
+    out.sort(key=lambda x: (order[x["status"]], x["number"]))
+    return {
+        "slots": out,
+        "summary": {
+            "total": len(out),
+            "live": sum(1 for x in out if x["status"] == "live"),
+            "ready": sum(1 for x in out if x["status"] == "ready"),
+            "expired": sum(1 for x in out if x["status"] == "expired"),
+        },
+    }
+
+
+@api_router.put("/slots/{slot_id}")
+async def rename_slot(slot_id: str, body: SlotRename, user: dict = Depends(get_current_user)):
+    name = re.sub(r"\s+", " ", body.name).strip()
+    if not 1 <= len(name) <= 40:
+        raise HTTPException(status_code=400, detail="Slot name must be 1–40 characters")
+    if user.get("plan") == "lifetime":
+        if not any(e["slot_id"] == slot_id for e in _lifetime_slots(user)):
+            raise HTTPException(status_code=404, detail="Slot not found")
+        await db.users.update_one({"user_id": user["user_id"]}, {"$set": {f"slot_names.{slot_id}": name}})
+    else:
+        entries = _retained_entries(user)
+        target = next((e for e in entries if e["slot_id"] == slot_id), None)
+        if not target:
+            raise HTTPException(status_code=404, detail="Slot not found")
+        target["name"] = name
+        await db.users.update_one({"user_id": user["user_id"]}, {"$set": {"active_plans": entries}})
+    await db.live_streams.update_many({"user_id": user["user_id"], "slot_id": slot_id}, {"$set": {"slot_name": name}})
+    return {"slot_id": slot_id, "name": name}
+
+
 # ==================== STREAM WITH KEY (Multi-slot support) ====================
 
 @api_router.get("/streams")
@@ -2212,6 +2367,22 @@ async def start_stream_with_key(data: StreamKeyStart, user: dict = Depends(get_c
             detail=f"You already have {active_count} live stream(s), which is your maximum of {max_slots}. Stop an existing stream before starting another."
         )
 
+    # Bind this stream to one specific slot so the UI can show which video runs where
+    now_ts = datetime.now(timezone.utc)
+    active_slots = [e for e in _all_slots(user) if e["expires_at"] > now_ts]
+    busy_slot_ids = {s["slot_id"] async for s in db.live_streams.find(
+        {"user_id": user["user_id"], "is_live": True, "slot_id": {"$exists": True}}, {"slot_id": 1})}
+    if data.slot_id:
+        slot = next((e for e in active_slots if e["slot_id"] == data.slot_id), None)
+        if not slot:
+            raise HTTPException(status_code=404, detail="This slot is expired or doesn't exist. Renew it or pick another slot.")
+        if data.slot_id in busy_slot_ids:
+            raise HTTPException(status_code=409, detail=f"'{slot['name']}' is already live. Stop it first or use another slot.")
+    else:
+        slot = next((e for e in active_slots if e["slot_id"] not in busy_slot_ids), None)
+        if not slot:
+            raise HTTPException(status_code=403, detail="All your slots are currently live. Stop one or add a new slot.")
+
     # Prevent the exact same stream_key from being used twice concurrently on this account
     dup = await db.live_streams.find_one(
         {"user_id": user["user_id"], "is_live": True, "stream_key": stream_key}
@@ -2244,14 +2415,18 @@ async def start_stream_with_key(data: StreamKeyStart, user: dict = Depends(get_c
         "video_id": video["video_id"],
         "stream_method": "manual_key",
         "stream_key": stream_key,  # stored so we can dedupe & audit
+        "slot_id": slot["slot_id"],
+        "slot_name": slot["name"],
         "ffmpeg_pid": pid,
         "started_at": datetime.now(timezone.utc),
     }
     await db.live_streams.insert_one(stream_doc)
 
     return {
-        "message": "You are now live on YouTube!",
+        "message": f"'{slot['name']}' is now live on YouTube!",
         "stream_id": stream_id,
+        "slot_id": slot["slot_id"],
+        "slot_name": slot["name"],
         "current_video": video["title"],
         "slot": {"used": active_count + 1, "max": max_slots},
         "watch_hint": "Open YouTube Studio to view your live stream."
@@ -2596,22 +2771,29 @@ async def startup_event():
 
                     live_entries = _active_entries(user)
                     slot_budget = len(live_entries)
+                    live_slot_ids = {e["slot_id"] for e in live_entries if e.get("slot_id")}
 
                     if slot_budget == 0:
                         # All plans expired — kill every live stream for this user.
                         to_kill = streams
                         reason = "plan_expired_sweep"
-                    elif len(streams) > slot_budget:
-                        # Slot count shrank — kill newest-first excess streams.
-                        streams_sorted = sorted(
-                            streams,
-                            key=lambda s: s.get("started_at") or datetime.min.replace(tzinfo=timezone.utc),
-                            reverse=True,
-                        )
-                        to_kill = streams_sorted[: len(streams_sorted) - slot_budget]
-                        reason = "slot_shrink_sweep"
                     else:
-                        continue
+                        # Slot-bound streams die with their own slot; legacy
+                        # streams (no slot_id) fall back to newest-first trimming.
+                        bound_dead = [s for s in streams if s.get("slot_id") and s["slot_id"] not in live_slot_ids]
+                        remaining = [s for s in streams if s not in bound_dead]
+                        excess = []
+                        if len(remaining) > slot_budget:
+                            legacy = sorted(
+                                [s for s in remaining if not s.get("slot_id")],
+                                key=lambda s: s.get("started_at") or datetime.min.replace(tzinfo=timezone.utc),
+                                reverse=True,
+                            )
+                            excess = legacy[: len(remaining) - slot_budget]
+                        to_kill = bound_dead + excess
+                        reason = "slot_shrink_sweep"
+                        if not to_kill:
+                            continue
 
                     for s in to_kill:
                         pid = s.get("ffmpeg_pid")
@@ -2649,7 +2831,7 @@ async def startup_event():
                         await db.users.update_one(
                             {"user_id": user_id},
                             {"$set": {
-                                "active_plans": [],
+                                "active_plans": _retained_entries(user),
                                 "plan": None,
                                 "plan_expires_at": None,
                                 "stream_slots": 0,
@@ -2675,7 +2857,7 @@ async def startup_event():
                         continue
                     await db.users.update_one(
                         {"user_id": uid},
-                        {"$set": {"active_plans": [], "plan": None, "plan_expires_at": None, "stream_slots": 0}},
+                        {"$set": {"active_plans": _retained_entries(u), "plan": None, "plan_expires_at": None, "stream_slots": 0}},
                     )
                     wiped = await wipe_all_videos_for_user(uid)
                     if wiped:

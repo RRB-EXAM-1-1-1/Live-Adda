@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { CreditCard, Clock, CheckCircle, Loader2 } from 'lucide-react';
 import { Button } from '../components/ui/button';
-import { razorpayAPI, billingAPI } from '../services/api';
+import { razorpayAPI, billingAPI, slotsAPI } from '../services/api';
 import { useAuth } from '../contexts/AuthContext';
 import { toast } from 'sonner';
 
@@ -46,10 +46,22 @@ const Billings = () => {
 
   const hasActivePlan = user?.plan && user?.plan_expires_at;
 
+  // Renew flow: /dashboard/billings?renew=<slot_id>  (from My Slots → Renew)
+  const renewSlotId = searchParams.get('renew');
+  const [renewSlot, setRenewSlot] = useState(null);
+
   useEffect(() => {
     loadBillingData();
     syncPendingPayments(false);
+    if (renewSlotId) {
+      slotsAPI.list().then(({ data }) => {
+        const s = data?.slots?.find((x) => x.slot_id === renewSlotId);
+        if (s) setRenewSlot(s); else toast.error('That slot was not found. You can buy a new slot below.');
+      });
+    }
   }, []);
+
+  const clearRenew = () => { setRenewSlot(null); setSearchParams({}); };
 
   const loadBillingData = async () => {
     const planResult = await billingAPI.getCurrentPlan();
@@ -73,13 +85,13 @@ const Billings = () => {
     }
   };
 
-  const handlePurchase = async (planId) => {
+  const handlePurchase = async (planId, slotToRenew = null) => {
     if (!window.Razorpay) {
       toast.error('Payment gateway is still loading. Please try again in a moment.');
       return;
     }
-    setProcessingPlan(planId);
-    const { data, error } = await razorpayAPI.createOrder(planId);
+    setProcessingPlan(slotToRenew ? `renew-${slotToRenew}` : planId);
+    const { data, error } = await razorpayAPI.createOrder(planId, slotToRenew);
 
     if (!data) {
       setProcessingPlan(null);
@@ -92,7 +104,7 @@ const Billings = () => {
       amount: data.amount,
       currency: data.currency,
       name: 'Live Adda',
-      description: `${data.plan_name} Plan`,
+      description: slotToRenew ? `Renew slot — ${data.plan_name}` : `New slot — ${data.plan_name}`,
       order_id: data.order_id,
       prefill: data.prefill,
       theme: { color: '#059669' },
@@ -106,9 +118,10 @@ const Billings = () => {
         setPollingPayment(false);
         setProcessingPlan(null);
         if (verify.data) {
-          toast.success('🎉 Payment successful! Your plan is now active.');
+          toast.success(slotToRenew ? '🎉 Slot renewed successfully!' : '🎉 Payment successful! Your new slot is ready.');
           await refreshUser();
           await loadBillingData();
+          if (slotToRenew) { clearRenew(); navigate('/dashboard/live-slot'); }
         } else {
           toast.error(verify.error || 'Payment verification failed');
         }
@@ -199,7 +212,7 @@ const Billings = () => {
             })}
           </div>
           <p className="text-gray-500 text-xs mt-4">
-            💡 Buy a <b>different</b> plan to unlock another concurrent stream slot. Re-buying the same plan simply extends its duration.
+            💡 Each purchase below adds one more slot. To extend an existing slot, use <b>Renew</b> on the My Slots page.
           </p>
         </div>
       )}
@@ -238,12 +251,42 @@ const Billings = () => {
         </div>
       )}
 
+      {/* Renew a specific slot */}
+      {renewSlot && (
+        <div className="rounded-2xl p-6 border border-amber-500/40 bg-amber-500/10" data-testid="renew-slot-banner">
+          <div className="flex items-start justify-between gap-4 flex-wrap">
+            <div>
+              <p className="text-amber-300 text-xs font-semibold uppercase tracking-wider mb-1">Renewing slot</p>
+              <h2 className="text-2xl font-bold text-white">{renewSlot.name}</h2>
+              <p className="text-gray-300 text-sm mt-1">
+                {renewSlot.plan_name} plan · {renewSlot.status === 'expired'
+                  ? 'expired — renewing restarts it from today'
+                  : `expires ${new Date(renewSlot.expires_at).toLocaleString()} — renewing adds time on top`}
+              </p>
+              <p className="text-gray-400 text-xs mt-2">Your slot name stays the same. Pick how long to extend it:</p>
+            </div>
+            <Button variant="ghost" className="text-gray-400 hover:text-white" onClick={clearRenew} data-testid="renew-cancel-btn">Cancel</Button>
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mt-4">
+            {PLANS.map((p) => (
+              <Button key={p.id} disabled={!!processingPlan} onClick={() => handlePurchase(p.id, renewSlot.slot_id)}
+                data-testid={`renew-with-${p.id}`}
+                className={`h-auto py-3 flex-col ${p.id === renewSlot.plan_id ? 'bg-amber-500 hover:bg-amber-600 text-black' : 'bg-gray-700 hover:bg-gray-600 text-white'}`}>
+                <span className="font-bold">+{p.duration}</span>
+                <span className="text-xs opacity-80">₹{p.price}{p.id === renewSlot.plan_id ? ' · same plan' : ''}</span>
+              </Button>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* Available Plans */}
-      <div className="bg-gray-800/50 backdrop-blur-lg rounded-2xl p-6 border border-gray-700">
-        <h2 className="text-xl font-bold text-white mb-6 flex items-center">
+      <div className="bg-gray-800/50 backdrop-blur-lg rounded-2xl p-6 border border-gray-700" id="plans">
+        <h2 className="text-xl font-bold text-white mb-1 flex items-center">
           <CreditCard className="w-5 h-5 mr-2 text-blue-500" />
-          Available Plans
+          Add a New Slot
         </h2>
+        <p className="text-gray-400 text-sm mb-6">Every purchase adds one more live slot. Buy as many as you need — 1, 5 or 50.</p>
 
         <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
           {PLANS.map((plan) => {
@@ -287,7 +330,7 @@ const Billings = () => {
                   {isProcessing ? (
                     <><Loader2 className="w-4 h-4 mr-2 animate-spin" /> Processing...</>
                   ) : isCurrent ? (
-                    'Renew / Recharge'
+                    'Add Another Slot'
                   ) : (
                     'Buy Now'
                   )}

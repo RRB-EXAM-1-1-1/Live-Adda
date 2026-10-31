@@ -31,7 +31,7 @@ const DashboardLayout = () => {
   const navigation = [
     { name: 'Dashboard', path: '/dashboard', icon: LayoutDashboard },
     { name: 'Video Manager', path: '/dashboard/videos', icon: Video },
-    { name: 'Live Slot', path: '/dashboard/live-slot', icon: RadioIcon },
+    { name: 'My Slots', path: '/dashboard/live-slot', icon: RadioIcon },
     { name: 'Billings', path: '/dashboard/billings', icon: CreditCard },
     { name: 'Profile', path: '/dashboard/profile', icon: UserCircle },
     ...(isAdmin ? [{ name: 'Analytics', path: '/dashboard/analytics', icon: BarChart3 }] : []),
