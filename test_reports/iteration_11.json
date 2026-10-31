@@ -1,0 +1,44 @@
+{
+  "summary": "Tested the My Slots feature end to end. Backend: new suite tests/test_slots_feature.py has 9 passing tests and 1 skipped (Razorpay order creation fails auth in preview). Covered: GET /api/slots shape, summary and status; the 30-day retention cutoff (a slot expired 40 days ago is pruned, one expired 5 days ago shows as expired); PUT rename (whitespace trim/collapse, 400 for empty or 41 chars, 40 chars accepted, 404 for an unknown slot, 401 without auth, rename reaches live_streams.slot_name); activate_or_extend_plan (buying the same plan twice gives 2 new slots, renewing an active slot adds exactly +1 day and keeps its name, renewing an expired slot sets now+7d and keeps its name); start-with-key (404 on an expired slot, 409 on a duplicate slot, slot validation passes and then the encoder fails with 500 on the fake key, as expected); a seeded live stream makes its slot 'live' with video_title and sorts it first; after stop the slot is 'ready' again; admin lifetime_1..3 can be renamed and lifetime_9 gives 404. Frontend (Playwright): every listed data-testid works — summary chips, filter (all/live/ready/expired gives 3/1/1/1 cards), Add Slot and empty-state buttons go to billings, inline rename with Enter and with the save button survives a reload, the empty-name toast shows, Go Live is disabled until a key is entered and shows the encoder error toast on a fake key, Stop (with confirm dialog) turns the slot Ready and deletes its video, expired slots have the amber Renew button, Renew goes to /dashboard/billings?renew=<id> with the banner, slot name and daily/weekly/monthly buttons, cancel clears the banner and the query, the create-order payload contains renew_slot_id, and the section is titled 'Add a New Slot'. Admin shows 3 lifetime cards with no Renew. Video Manager, Billings and /dashboard/analytics load with no page errors. Mobile layout has no horizontal overflow.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "POST /api/razorpay/create-order", "issue": "In preview, Razorpay returns 'Authentication failed' (live keys rejected), so the backend returns 502. Cloudflare replaces 502 bodies with its own HTML page, so the frontend toast shows 'The origin web server returned an invalid or incomplete response to Cloudflare...' instead of 'Failed to create Razorpay order'. Use 503 or 400 (not 502/504) for gateway errors so the JSON detail reaches the UI. Because of this, it was not possible to check that a VALID renew_slot_id gets saved on payment_transactions; this was code-reviewed only (server.py line ~1849 looks correct). The invalid renew_slot_id → 404 check works, since it runs before the Razorpay call."},
+      {"endpoint": "POST /api/razorpay/create-order (lifetime admin)", "issue": "Lifetime users are not blocked from buying. The admin sees 'Add Slot', and a paid order would run activate_or_extend_plan, which sets plan='daily' and stream_slots=1. That overwrites the admin's lifetime plan until the seed runs again. Reject create-order (or skip activation) when user.plan=='lifetime', or hide Add Slot for lifetime users."},
+      {"endpoint": "sweeper / _active_entries", "issue": "Legacy users whose active_plans entries have no slot_id (or legacy plan/plan_expires_at only): _active_entries returns slot_id=None, but start-with-key binds the stream to the md5-derived id from _retained_entries. check_active_plan does not persist the ids when all entries are live. If GET /api/slots was never called, the sweeper's live_slot_ids is empty, so the bound stream counts as bound_dead and gets KILLED. Fix: make _active_entries derive the same legacy slot_id, or persist the slot ids before binding in start-with-key."},
+      {"endpoint": "check_active_plan", "issue": "stored active_plans now includes expired slots that are still retained, so len(stored) != len(live) whenever a user has any expired slot. Every gated call then runs sync_user_plans_and_enforce_slots (DB write plus stream scan). This is a performance cost, not a correctness bug."},
+      {"endpoint": "PUT /api/slots, activate_or_extend_plan", "issue": "Both read, modify and rewrite the whole active_plans array. A rename racing with a webhook/reconcile activation can lose the new slot. Use positional $set (active_plans.$.name) for rename and $push for a new slot."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [
+      {"component": "Billings renew (invalid id)", "issue": "The 'That slot was not found' toast fires twice (effect runs twice under StrictMode, or a duplicate fetch)", "selector": "[data-sonner-toast]", "priority": "LOW"},
+      {"component": "SlotCard", "issue": "videoId/name state is set only at mount. If videos were empty at mount and the user uploads later, or the selected video is deleted, the select shows a video while the state is ''/stale, so Go Live stays disabled or sends a deleted video_id. Sync with useEffect on the videos and slot.name props.", "selector": "slot-video-select-<id>", "priority": "LOW"}
+    ],
+    "integration_issues": [],
+    "design_issues": [
+      {"screen": "My Slots (mobile 390px)", "issues": ["Slot name is truncated hard ('Bhajan …') because the status pill shares the row. Consider putting the pill on its own line on mobile."]},
+      {"screen": "Billings", "issues": ["The legacy 'Current Plan: Weekly Plan' blue card is still shown above the slot-based 'Your Active Plans' and renew banner, which is confusing in the multi-slot model."]},
+      {"screen": "SlotCard", "issues": ["The rename cancel (X) button has no data-testid."]}
+    ]
+  },
+  "test_report_links": ["/app/backend/tests/test_slots_feature.py", "/app/backend/tests/seed_ui_slots.py", "/app/test_reports/pytest/pytest_slots.xml", "/app/test_reports/pytest/pytest_results.xml"],
+  "action_items": [
+    "Return 503/400 instead of 502 from razorpay create-order on gateway failure (Cloudflare hides 502 JSON bodies). Check the Razorpay keys in preview (Authentication failed).",
+    "Block purchases/activation for lifetime (admin) users, or hide Add Slot for them, so a payment cannot overwrite plan=lifetime",
+    "Make _active_entries return the same legacy slot_id as _retained_entries (or persist ids before binding) so the sweeper doesn't kill slot-bound streams for legacy users",
+    "Update stale tests in tests/backend_test.py: admin plan is now 'lifetime', not 'monthly'; TestIter10ActivateOrExtendPlan/TestIter10RazorpayVerifyStacksSamePlan expect the old stacking semantics but same-plan purchases now create separate slots by design",
+    "Optional: positional Mongo updates for rename/activation; de-dupe the renew-not-found toast; sync SlotCard state with props"
+  ],
+  "critical_code_review_comments": [
+    "server.py is 3700+ lines; split slots/payments/streams into routers",
+    "activate_or_extend_plan names new slots 'Slot {len(entries)+1}' counting expired ones too. Numbering can collide with renamed slots (cosmetic).",
+    "GET /api/slots assigns legacy unbound streams to the first active slot by order, while start-with-key auto-pick ignores unbound streams. The two can disagree on which slot is busy for legacy streams."
+  ],
+  "updated_files": ["/app/backend/tests/test_slots_feature.py", "/app/backend/tests/seed_ui_slots.py"],
+  "success_rate": {"backend": "100% of new slot tests (9/9 passed, 1 skipped due to Razorpay auth); full legacy suite 108/125, and the 17 failures are stale expectations or environment (Razorpay auth, fake RTMP key), not regressions from this feature", "frontend": "100% of requested flows"},
+  "seed_data_creation": "UI users: test_ui_slots@example.com / TestPass123! (slots slot_uiready 'Bhajan Channel', slot_uilive (now ready), slot_uiexp 'Old Expired' expired) and test_ui_empty@example.com / TestPass123! (no slots). Re-seed with `python3 /app/backend/tests/seed_ui_slots.py`. test_slots_feature.py creates and deletes its own test_slots_* user.",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Run `pytest tests/test_slots_feature.py -n 0` from /app/backend. Razorpay create-order returns 502 in preview (auth failed) and start-with-key with a fake key returns 500 'Encoder failed', so seed live_streams directly to test live states. The old backend_test.py has stale expectations (admin plan monthly, same-plan stacking)."
+}

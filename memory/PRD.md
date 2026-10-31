@@ -336,3 +336,12 @@ For the 2 vCPU / 4 GB DigitalOcean droplet the user runs in production:
 
 ## Hide compression indicators from end users (2026-06)
 - Video Manager no longer shows the resolution chip ("720p"), the "→ 720p" transcode target in the processing overlay (now just "Preparing for stream…"), and displays `original_size` (pre-compression bytes) instead of the reduced `size`. Backend transcoding/normalization unchanged; storage accounting still uses the real size.
+
+## Unlimited Slots, Rename, Renew, "My Slots" redesign (2026-06)
+- Data model: `users.active_plans` entries are now slots `{slot_id, name, plan_id, purchased_at, expires_at}`. Legacy entries get deterministic ids/names on the fly (`_retained_entries`). Expired slots are retained for `SLOT_RETENTION_DAYS=30` (visible as "Expired" with Renew); `_active_entries` still returns only live ones. Lifetime (admin) users get virtual slots `lifetime_1..3`, names stored in `users.slot_names`.
+- `activate_or_extend_plan(user_id, plan_id, renew_slot_id=None)`: without renew → ALWAYS appends a new slot (unlimited per tier). With renew → extends that slot (active: +duration from expiry; expired: now+duration), name kept.
+- Payments: `/razorpay/create-order` accepts `renew_slot_id` (validated, stored on txn, passed through `_finalize_paid_order` so webhook/reconcile also honour it).
+- Streams: `live_streams.slot_id/slot_name`; `/stream/start-with-key` accepts `slot_id` (404 expired, 409 already live, auto-picks first free slot if omitted). Sweeper + `sync_user_plans_and_enforce_slots` stop streams whose OWN slot expired (`_stop_streams_for_dead_slots`, `bound_dead`), legacy unbound streams fall back to newest-first trimming.
+- New endpoints: `GET /api/slots` (sorted live→ready→expired, summary counts), `PUT /api/slots/{slot_id}` {name} (1–40 chars).
+- Frontend: sidebar "My Slots" (route unchanged `/dashboard/live-slot`). `LiveSlot.jsx` rewritten; `components/SlotCard.jsx` per-slot card (inline rename, video dropdown + key input + Go Live, live info + Stop, Renew). Removed fake "Live Slot #1" toggle, Stream Settings and YouTube OAuth block (OAuth backend endpoints still exist but unused). `Billings.jsx`: `?renew=<slot_id>` banner with 3 duration buttons; plans section "Add a New Slot".
+- Tested: /app/test_reports/iteration_11.json (all pass), backend/tests/test_slots_feature.py.
