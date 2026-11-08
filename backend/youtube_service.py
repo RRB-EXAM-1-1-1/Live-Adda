@@ -31,7 +31,8 @@ YOUTUBE_SCOPES = [
 # YouTube RTMP ingestion base. RTMPS is preferred: it survives firewalls/DPI
 # that occasionally drop bare RTMP packets and causes the "not receiving enough
 # video" alert. YouTube accepts the same stream key on both.
-RTMP_BASE = "rtmps://a.rtmp.youtube.com/live2"
+def _rtmp_base() -> str:
+    return os.environ.get("RTMP_INGEST_BASE") or "rtmps://a.rtmp.youtube.com/live2"
 
 
 def is_configured() -> bool:
@@ -183,6 +184,17 @@ def create_broadcast_and_stream(account_doc: dict, title: str, description: str 
 # If the backend restarts we lose this map; the reaper below (psutil) handles
 # such orphans by signalling directly and marking DB rows stopped.
 _running_procs: "dict[int, subprocess.Popen]" = {}
+_proc_logs: "dict[int, str]" = {}  # pid -> ffmpeg log path (for exit diagnostics)
+
+
+def _log_tail(log_path: str, n: int = 400) -> str:
+    try:
+        with open(log_path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - n))
+            return f.read().decode(errors="ignore").strip()
+    except Exception:
+        return ""
 _procs_lock = threading.Lock()
 
 
@@ -272,7 +284,7 @@ def start_ffmpeg_push(video_path: str, stream_key: str, loop: bool = True, bitra
     if not stream_key:
         raise ValueError("stream_key is empty")
 
-    rtmp_url = f"{RTMP_BASE}/{stream_key}"
+    rtmp_url = f"{_rtmp_base()}/{stream_key}"
     v_codec, a_codec = _probe_codecs(video_path)
     codec_ok = (v_codec == "h264" and a_codec == "aac")
     can_copy = False
@@ -373,9 +385,10 @@ def start_ffmpeg_push(video_path: str, stream_key: str, loop: bool = True, bitra
 
     with _procs_lock:
         _running_procs[proc.pid] = proc
+        _proc_logs[proc.pid] = log_path
     logger.info(
         f"Started ffmpeg push PID={proc.pid} mode={mode} "
-        f"src_codecs=v:{v_codec}/a:{a_codec} log={log_path} -> {RTMP_BASE}/***"
+        f"src_codecs=v:{v_codec}/a:{a_codec} log={log_path} -> {_rtmp_base()}/***"
     )
     return proc.pid
 
@@ -445,19 +458,47 @@ def stop_ffmpeg_push(pid: int) -> bool:
     return True
 
 
-def reap_finished_pushes() -> list[int]:
-    """Reap any tracked ffmpeg processes that exited on their own (e.g. YouTube
-    dropped the connection, source file was removed). Returns list of PIDs
-    that finished. Callers should mark the DB row `is_live=False` for these.
-    """
-    finished: list[int] = []
+_adopted: "dict[int, object]" = {}  # pid -> psutil.Process for ffmpeg started by a previous backend run
+
+
+def adopt_ffmpeg_pid(pid: int) -> bool:
+    """After a backend restart, re-track an ffmpeg process we didn't spawn in
+    this run so the reaper/supervisor still notice when it dies."""
+    try:
+        import psutil
+        p = psutil.Process(pid)
+        if "ffmpeg" not in " ".join(p.cmdline()).lower():
+            return False
+        with _procs_lock:
+            _adopted[pid] = p
+        return True
+    except Exception:
+        return False
+
+
+def reap_finished_pushes() -> list[dict]:
+    """Reap tracked ffmpeg processes that exited on their own (YouTube dropped
+    the RTMP connection, network blip, source file removed...).
+    Returns [{pid, rc, tail}] so the caller can decide to restart or give up."""
+    finished: list[dict] = []
     with _procs_lock:
         for pid, proc in list(_running_procs.items()):
             rc = proc.poll()
             if rc is not None:
                 _running_procs.pop(pid, None)
-                finished.append(pid)
-                logger.info(f"ffmpeg pid={pid} exited on its own rc={rc}")
+                log_path = _proc_logs.pop(pid, "")
+                tail = _log_tail(log_path) if log_path else ""
+                finished.append({"pid": pid, "rc": rc, "tail": tail[-300:]})
+                logger.warning(f"ffmpeg pid={pid} exited on its own rc={rc} tail={tail[-200:]!r}")
+        for pid, p in list(_adopted.items()):
+            try:
+                alive = p.is_running() and p.status() != "zombie"
+            except Exception:
+                alive = False
+            if not alive:
+                _adopted.pop(pid, None)
+                finished.append({"pid": pid, "rc": None, "tail": "(adopted process exited)"})
+                logger.warning(f"adopted ffmpeg pid={pid} exited on its own")
     return finished
 
 

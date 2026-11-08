@@ -2578,6 +2578,18 @@ async def startup_event():
         )
         logger.info(f"Backfilled stream_id={new_sid} on legacy stream for user {legacy.get('user_id')}")
 
+    # Recovery after a backend restart: re-track ffmpeg processes that are
+    # still running, and clear pids that are gone so the supervisor restarts
+    # them instead of leaving a "live" row with a dead encoder.
+    await db.live_streams.update_many({"_restart_pending": True}, {"$unset": {"_restart_pending": ""}})
+    async for s in db.live_streams.find({"is_live": True, "ffmpeg_pid": {"$ne": None}}):
+        pid = s.get("ffmpeg_pid")
+        if pid and youtube_service.adopt_ffmpeg_pid(pid):
+            logger.info(f"startup: adopted running ffmpeg pid={pid} for stream {s.get('stream_id')}")
+        else:
+            await db.live_streams.update_one({"_id": s["_id"]}, {"$set": {"ffmpeg_pid": None, "last_exit_tail": "(encoder not running after backend restart)"}})
+            logger.warning(f"startup: stream {s.get('stream_id')} had dead pid={pid} — queued for auto-restart")
+
     # Recovery: if backend crashed while a transcode was in-flight, the video
     # is stuck in processing_status='transcoding' forever. On startup, resume
     # by re-scheduling any pending transcodes (or mark 'completed' if the file
@@ -2709,35 +2721,100 @@ async def startup_event():
             f.write("- GET /api/videos\n")
             f.write("- POST /api/payments/checkout-session\n")
 
-    # Background reaper: catches ffmpeg processes that exited on their own
-    # (YouTube dropped RTMP, source file was deleted, etc.) and marks the
-    # matching live_streams row `is_live=False`. Prevents zombie processes
-    # from lingering and keeps the "live users" admin table accurate.
+    # Background reaper + SUPERVISOR: catches ffmpeg processes that exited on
+    # their own (YouTube reset the RTMP connection, network blip, loop-boundary
+    # hiccup...). Previously ANY such exit ended the stream permanently and
+    # deleted the video — the root cause of "my stream ended by itself"
+    # tickets. Now we restart ffmpeg with backoff; only after
+    # MAX_AUTO_RESTARTS failures inside RESTART_WINDOW do we give up.
+    MAX_AUTO_RESTARTS = 8
+    RESTART_WINDOW = timedelta(hours=1)
+
+    async def _give_up_stream(s: dict, reason: str, exit_info: dict):
+        await db.live_streams.update_one(
+            {"_id": s["_id"]},
+            {"$set": {
+                "is_live": False,
+                "ffmpeg_pid": None,
+                "stopped_at": datetime.now(timezone.utc),
+                "stopped_reason": reason,
+                "last_exit_rc": exit_info.get("rc"),
+                "last_exit_tail": exit_info.get("tail"),
+            }},
+        )
+        logger.error(f"supervisor: stream {s.get('stream_id')} user={s.get('user_id')} ended ({reason}) rc={exit_info.get('rc')} tail={exit_info.get('tail')!r}")
+        vid, uid = s.get("video_id"), s.get("user_id")
+        if vid and uid:
+            try:
+                await cleanup_stream_video_if_orphaned(uid, vid)
+            except Exception as e:
+                logger.warning(f"reaper: video cleanup failed vid={vid}: {e}")
+
+    async def _try_restart_stream(s: dict, exit_info: dict):
+        now = datetime.now(timezone.utc)
+        history = [t for t in (s.get("restart_history") or []) if _as_utc(t) and _as_utc(t) > now - RESTART_WINDOW]
+        if len(history) >= MAX_AUTO_RESTARTS:
+            await _give_up_stream(s, "ffmpeg_exited_after_retries", exit_info)
+            return
+        user = await db.users.find_one({"user_id": s["user_id"]})
+        if not user or (user.get("plan") != "lifetime" and not _active_entries(user)):
+            await _give_up_stream(s, "ffmpeg_exited_plan_inactive", exit_info)
+            return
+        video = await db.videos.find_one({"video_id": s.get("video_id")}, {"_id": 0})
+        path = (video or {}).get("file_path")
+        if not path or not os.path.exists(path):
+            await _give_up_stream(s, "ffmpeg_exited_video_missing", exit_info)
+            return
+        if not s.get("stream_key"):
+            await _give_up_stream(s, "ffmpeg_exited", exit_info)
+            return
+        # Backoff: 5s, 10s, 20s ... capped at 60s — spreads reconnects so a
+        # YouTube-side hiccup doesn't make 30 streams hammer ingest at once.
+        await asyncio.sleep(min(60, 5 * (2 ** len(history))))
+        fresh = await db.live_streams.find_one({"_id": s["_id"]}, {"is_live": 1, "ffmpeg_pid": 1})
+        if not fresh or not fresh.get("is_live") or fresh.get("ffmpeg_pid"):
+            return  # user/admin stopped it (or it was restarted elsewhere) meanwhile
+        try:
+            pid = await asyncio.to_thread(
+                youtube_service.start_ffmpeg_push, path, s["stream_key"], True,
+                1200 if s.get("auto_lowered_bitrate") else 1800,
+            )
+        except Exception as e:
+            logger.warning(f"supervisor: restart failed for stream {s.get('stream_id')}: {e}")
+            await db.live_streams.update_one(
+                {"_id": s["_id"]},
+                {"$push": {"restart_history": now}, "$set": {"last_exit_rc": exit_info.get("rc"), "last_exit_tail": exit_info.get("tail")}},
+            )
+            # Leave is_live=True; the next reaper pass sees no pid and retries.
+            return
+        await db.live_streams.update_one(
+            {"_id": s["_id"]},
+            {"$push": {"restart_history": now},
+             "$set": {"ffmpeg_pid": pid, "restarted_at": now, "restarted_reason": "ffmpeg_exited_auto_restart",
+                      "last_exit_rc": exit_info.get("rc"), "last_exit_tail": exit_info.get("tail")},
+             "$inc": {"auto_restarts": 1}},
+        )
+        logger.info(f"supervisor: auto-restarted stream {s.get('stream_id')} user={s['user_id']} new_pid={pid} (restart #{len(history) + 1})")
+
+    async def _supervise(row: dict, info: dict):
+        await db.live_streams.update_one({"_id": row["_id"]}, {"$set": {"_restart_pending": True, "ffmpeg_pid": None}})
+        try:
+            await _try_restart_stream(row, info)
+        finally:
+            await db.live_streams.update_one({"_id": row["_id"]}, {"$unset": {"_restart_pending": ""}})
+
     async def _ffmpeg_reaper_loop():
         while True:
             try:
                 finished = youtube_service.reap_finished_pushes()
-                for pid in finished:
-                    # Find every stream row that was live under this pid so we
-                    # can also auto-purge its video (freeing disk immediately
-                    # when a stream naturally ends).
-                    async for s in db.live_streams.find({"ffmpeg_pid": pid, "is_live": True}):
-                        await db.live_streams.update_one(
-                            {"_id": s["_id"]},
-                            {"$set": {
-                                "is_live": False,
-                                "ffmpeg_pid": None,
-                                "stopped_at": datetime.now(timezone.utc),
-                                "stopped_reason": "ffmpeg_exited",
-                            }},
-                        )
-                        vid = s.get("video_id")
-                        uid = s.get("user_id")
-                        if vid and uid:
-                            try:
-                                await cleanup_stream_video_if_orphaned(uid, vid)
-                            except Exception as e:
-                                logger.warning(f"reaper: video cleanup failed vid={vid}: {e}")
+                for info in finished:
+                    async for s in db.live_streams.find({"ffmpeg_pid": info["pid"], "is_live": True}):
+                        asyncio.create_task(_supervise(s, info))
+                # Streams flagged live with no pid and no restart in flight
+                # (previous restart attempt failed, or backend was restarted) — retry.
+                async for s in db.live_streams.find({"is_live": True, "ffmpeg_pid": None, "stream_method": "manual_key",
+                                                     "_restart_pending": {"$ne": True}}):
+                    asyncio.create_task(_supervise(s, {"rc": s.get("last_exit_rc"), "tail": s.get("last_exit_tail")}))
             except Exception as e:
                 logger.warning(f"ffmpeg reaper loop error: {e}")
             await asyncio.sleep(15)
